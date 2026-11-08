@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=screenRIG Screens
+Comment=Your signage screens: status, actions and casting
+Exec=omarchy-shell shell toggle screenrig.omarchy
+Icon=video-display
+Categories=Utility;
+Keywords=signage;screens;screenrig;tv;

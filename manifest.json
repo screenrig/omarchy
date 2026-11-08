@@ -1,0 +1,39 @@
+{
+  "schemaVersion": 1,
+  "id": "screenrig.omarchy",
+  "name": "screenRIG",
+  "version": "26.11.0-dev",
+  "author": "screenRIG",
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/screenrig/omarchy",
+  "description": "Your screenRIG screens on the Omarchy desktop: bar chip, screens panel, live cast and cast to screens, agent chat and notifications.",
+  "kinds": [
+    "service",
+    "bar-widget",
+    "panel"
+  ],
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml",
+    "panel": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "screenRIG",
+    "description": "Screens online and offline; click for the screens panel, right-click to cast a capture.",
+    "category": "Productivity",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "showCounts": true
+    },
+    "schema": [
+      {
+        "key": "showCounts",
+        "type": "boolean",
+        "label": "Show online and offline counts",
+        "defaultValue": true
+      }
+    ]
+  },
+  "keepLoaded": true
+}

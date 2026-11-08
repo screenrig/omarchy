@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+"""xdg-desktop-portal-hyprland custom picker for screenRIG live casts.
+
+When the screenRIG panel picked a window or monitor a moment ago, answer the
+portal with it so no second picker appears. Otherwise run the picker this
+desktop used before (recorded at install), so every other screen share is
+unchanged.
+"""
+
+import os
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache"), "screenrig-omarchy")
+STATE = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local", "state"), "screenrig-omarchy")
+PICK = os.path.join(CACHE, "live-pick")
+
+
+def fallback_picker():
+    try:
+        with open(os.path.join(STATE, "xdph-original-picker")) as f:
+            value = f.read().strip()
+            if value:
+                return value
+    except OSError:
+        pass
+    return "hyprland-share-picker"
+
+
+def window_id(address_hex, sharing_list):
+    """The portal's id for a Hyprland window address (hex, with or without 0x)."""
+    try:
+        wanted = int(address_hex.lower().removeprefix("0x"), 16)
+    except ValueError:
+        return None
+    for entry in sharing_list.split("[HA>]"):
+        if "[HC>]" not in entry or "[HE>]" not in entry:
+            continue
+        pid = entry.split("[HC>]", 1)[0]
+        address = entry.rsplit("[HE>]", 1)[1]
+        if address.isdigit() and int(address) == wanted:
+            return pid
+    return None
+
+
+def main():
+    try:
+        fresh = time.time() - os.path.getmtime(PICK) < 20
+        with open(PICK) as f:
+            want = f.read().strip()
+        os.remove(PICK)
+    except OSError:
+        fresh, want = False, ""
+    if fresh and want.startswith("screen:"):
+        print("[SELECTION]/" + want)
+        return 0
+    if fresh and want.startswith("window:"):
+        pid = window_id(want.split(":", 1)[1], os.environ.get("XDPH_WINDOW_SHARING_LIST", ""))
+        if pid:
+            print("[SELECTION]/window:" + pid)
+            return 0
+    picker = fallback_picker()
+    os.execvp(picker, [picker] + sys.argv[1:])
+
+
+if __name__ == "__main__":
+    sys.exit(main())
