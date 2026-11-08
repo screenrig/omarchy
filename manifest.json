@@ -4,7 +4,7 @@
   "name": "screenRIG",
   "version": "26.11.0-dev",
   "author": "screenRIG",
-  "license": "Apache-2.0",
+  "license": "MIT",
   "homepage": "https://github.com/screenrig/omarchy",
   "description": "Your screenRIG screens on the Omarchy desktop: bar chip, screens panel, live cast and cast to screens, agent chat and notifications.",
   "kinds": [

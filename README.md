@@ -50,4 +50,4 @@ o.bind("SUPER + ALT + X", "Stop casting",      [[omarchy-shell shell call screen
 
 ## License
 
-Apache-2.0.
+MIT, see [LICENSE](LICENSE).
