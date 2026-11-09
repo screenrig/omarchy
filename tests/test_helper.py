@@ -5,6 +5,7 @@ import os
 import re
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 loader = importlib.machinery.SourceFileLoader("helper", os.path.join(HERE, "..", "bin", "screenrig-omarchy"))
@@ -159,8 +160,22 @@ class AgentEvents(unittest.TestCase):
     def test_resume_commands(self):
         self.assertEqual(helper.agent_command("codex", "t1", "hi")[-3:], ["resume", "t1", "hi"])
         self.assertEqual(helper.agent_command("claude", "s1", "hi")[-2:], ["--resume", "s1"])
+        grok = helper.agent_command("grok", "g1", "hi")
+        self.assertEqual(grok[-2:], ["--resume", "g1"])
+        self.assertEqual(grok[grok.index("--output-format") + 1], "streaming-messages-json")
         with self.assertRaises(helper.Problem):
             helper.agent_command("pi", None, "hi")
+
+    def test_grok_messages_stream(self):
+        events = [
+            {"type": "system", "subtype": "init", "session_id": "g1"},
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "READY"}]}},
+            {"type": "result", "session_id": "g1", "is_error": False, "result": "READY"},
+        ]
+        out = [entry for event in events for entry in helper.normalize("grok", event, {})]
+        self.assertEqual(out, [{"kind": "session", "session": "g1"},
+                               {"kind": "text", "text": "READY"},
+                               {"kind": "session", "session": "g1"}])
 
 
 picker_loader = importlib.machinery.SourceFileLoader("picker", os.path.join(HERE, "..", "bin", "screenrig-share-picker"))
@@ -184,6 +199,66 @@ class LiveCast(unittest.TestCase):
 
 
 class PluginLookup(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.caches = {agent: os.path.join(self.tmp.name, agent) for agent in ("claude", "codex", "grok")}
+        patch = mock.patch.object(helper, "PLUGIN_CACHES", self.caches)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def install(self, agent, version="26.11.298"):
+        root = os.path.join(self.caches[agent], "screenrig-a1b2c3" if agent == "grok" else version)
+        for suffix in ("skills/screenrig/SKILL.md", "cli/dist/bin.js"):
+            path = os.path.join(root, suffix)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            open(path, "w").close()
+        os.makedirs(os.path.join(root, ".claude-plugin"))
+        with open(os.path.join(root, ".claude-plugin", "plugin.json"), "w") as f:
+            json.dump({"name": "screenrig", "version": version}, f)
+        return root
+
+    def test_default_grok_is_ready_when_plugin_is_installed(self):
+        for agent in self.caches:
+            self.install(agent)
+        with mock.patch.object(helper, "default_agent", return_value="grok"), \
+             mock.patch.object(helper.shutil, "which", side_effect=lambda name: "/bin/" + name), \
+             mock.patch.object(helper, "load_config", return_value={"token": "fixture"}):
+            status = helper.onboarding()
+        self.assertEqual(status["agent"], "grok")
+        self.assertTrue(status["plugin"] and status["cli"] and status["signed_in"])
+
+    def test_uses_installed_integration_when_default_has_no_plugin(self):
+        self.install("codex")
+        for preferred in ("grok", "claude", "other-agent"):
+            with self.subTest(preferred=preferred), \
+                 mock.patch.object(helper, "default_agent", return_value=preferred), \
+                 mock.patch.object(helper.shutil, "which", side_effect=lambda name: "/bin/" + name):
+                self.assertEqual(helper.panel_agent(), "codex")
+
+    def test_ignores_plugin_when_its_agent_executable_is_missing(self):
+        self.install("grok")
+        self.install("codex")
+        with mock.patch.object(helper, "default_agent", return_value="grok"), \
+             mock.patch.object(helper.shutil, "which", side_effect=lambda name: "/bin/codex" if name == "codex" else None):
+            self.assertEqual(helper.panel_agent(), "codex")
+
+    def test_offers_install_for_available_grok_when_no_plugin_is_installed(self):
+        with mock.patch.object(helper, "default_agent", return_value="grok"), \
+             mock.patch.object(helper.shutil, "which", side_effect=lambda name: "/bin/grok" if name == "grok" else None), \
+             mock.patch.object(helper, "load_config", return_value={}):
+            status = helper.onboarding()
+        self.assertEqual(status["agent_name"], "Grok")
+        self.assertTrue(status["installable"])
+        self.assertFalse(status["plugin"])
+
+    def test_grok_bundle_uses_manifest_version_for_cli_selection(self):
+        self.install("codex", "26.11.275")
+        grok = self.install("grok")
+        with mock.patch.dict(os.environ, {"SCREENRIG_CLI": ""}), \
+             mock.patch.object(helper.shutil, "which", return_value="/usr/bin/node"):
+            self.assertEqual(helper.cli_command(), ["/usr/bin/node", os.path.join(grok, "cli", "dist", "bin.js")])
+
     def test_newest_bundled_cli_across_agents(self):
         import tempfile
         from unittest import mock

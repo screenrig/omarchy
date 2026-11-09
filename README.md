@@ -25,8 +25,9 @@ your coding agent to change what plays.
   Players on your network, picked from live thumbnails with the arrow keys and
   Return, until you stop it or for a set time; or a region capture, the
   clipboard (an https link or an image) or a file, for 5 to 60 minutes.
-- **Agent**: a chat with your default coding agent (Claude Code or Codex) and
-  the screenRIG skill, resumed across messages.
+- **Agent**: a chat with Claude Code, Codex or Grok and the screenRIG skill,
+  resumed across messages. It uses your Omarchy default when its plugin is
+  installed, then another installed integration.
 - **Project switcher**, a screenRIG section in the Omarchy menu with every
   screen and playlist searchable, and notifications when a screen goes offline
   or comes back, a publish reaches its screens, credits run low, an ad booking
@@ -42,10 +43,11 @@ your coding agent to change what plays.
 omarchy plugin add https://github.com/screenrig/omarchy --enable
 ```
 
-On first open the panel sets up the rest, one button each: **Install** adds
-the official [screenRIG plugin](https://github.com/screenrig/plugin) (its
-skill and CLI) to your default agent, Claude Code or Codex, and **Sign in**
-approves this laptop at screenrig.ai. Already have the plugin and
+On first open the panel detects the official
+[screenRIG plugin](https://github.com/screenrig/plugin) in Claude Code, Codex
+and Grok. If it needs installing, **Install** adds its skill and CLI to the
+available agent named in the panel, preferring your Omarchy default.
+**Sign in** approves this laptop at screenrig.ai. Already have the plugin and
 `screenrig login`? The panel uses that sign-in
 (`~/.config/screenrig/config.json`) and lets the CLI renew it.
 
@@ -68,10 +70,9 @@ On first load it adds, and `teardown` removes:
 - two `.desktop` entries (the panel, and "Cast to a screenRIG screen" for files)
   and a theme hook in `~/.config/omarchy/hooks/theme-set.d/`.
 
-**Install** on the first-run card runs your agent's own plugin install
-(`claude plugin install screenrig@screenrig` or `codex plugin add
-screenrig@screenrig`, from github.com/screenrig/plugin); remove it with that
-agent's plugin commands.
+**Install** on the first-run card runs Claude Code, Codex or Grok's own
+plugin installer for github.com/screenrig/plugin; remove it with that agent's
+plugin commands.
 
 Live casting changes two more things, only after you press **Allow** in the
 Cast tab:
@@ -93,7 +94,8 @@ Cast tab:
   checks it against the release's published SHA-256 and keeps it in
   `~/.local/share/screenrig-omarchy/bin`; it serves RTSP over TCP on port 8554.
   Screens reach it on the same network: Android and Linux Players.
-- Agent: Claude Code or Codex as your Omarchy default agent
+- Agent: Claude Code, Codex or Grok with the screenRIG plugin. The panel
+  detects installed integrations and prefers your Omarchy default agent
   (`omarchy default agent`).
 
 ## Keybindings

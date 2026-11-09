@@ -82,6 +82,7 @@ def token_exp(token):
 PLUGIN_CACHES = {
     "claude": os.path.join(HOME, ".claude", "plugins", "cache", "screenrig", "screenrig"),
     "codex": os.path.join(HOME, ".codex", "plugins", "cache", "screenrig", "screenrig"),
+    "grok": os.path.join(HOME, ".grok", "installed-plugins"),
 }
 PLUGIN_SOURCE = "https://github.com/screenrig/plugin.git"
 PLUGIN_INSTALL = {
@@ -89,8 +90,32 @@ PLUGIN_INSTALL = {
                ["claude", "plugin", "install", "screenrig@screenrig", "--scope", "user"]],
     "codex": [["codex", "plugin", "marketplace", "add", PLUGIN_SOURCE, "--ref", "main", "--json"],
               ["codex", "plugin", "add", "screenrig@screenrig", "--json"]],
+    "grok": [["grok", "plugin", "install", PLUGIN_SOURCE + "#plugins/screenrig", "--trust"]],
 }
-AGENT_NAMES = {"claude": "Claude Code", "codex": "Codex"}
+AGENT_NAMES = {"claude": "Claude Code", "codex": "Codex", "grok": "Grok"}
+
+
+def plugin_dirs(agent):
+    """Plugin roots, excluding marketplace downloads and other plugins."""
+    cache = PLUGIN_CACHES.get(agent)
+    if not cache:
+        return []
+    pattern = "screenrig-*" if agent == "grok" else "*"
+    return glob.glob(os.path.join(cache, pattern))
+
+
+def installed_plugin_dirs(agent):
+    return [path for path in plugin_dirs(agent)
+            if os.path.isfile(os.path.join(path, "skills", "screenrig", "SKILL.md"))]
+
+
+def panel_agent():
+    """Prefer the default agent's installed integration, then any installed one."""
+    preferred = default_agent()
+    available = [agent for agent in PLUGIN_CACHES if shutil.which(agent)]
+    ordered = ([preferred] if preferred in available else []) + [agent for agent in available if agent != preferred]
+    return next((agent for agent in ordered if installed_plugin_dirs(agent)),
+                ordered[0] if ordered else preferred)
 
 
 def cli_command():
@@ -98,15 +123,27 @@ def cli_command():
     env = os.environ.get("SCREENRIG_CLI")
     if env:
         return env.split()
-    bundled = sorted((path for root in PLUGIN_CACHES.values()
-                      for path in glob.glob(os.path.join(root, "*", "cli", "dist", "bin.js"))),
-                     key=lambda p: [int(x) if x.isdigit() else 0 for x in os.path.basename(
-                         os.path.dirname(os.path.dirname(os.path.dirname(p)))).split(".")])
+    bundled = sorted((os.path.join(root, "cli", "dist", "bin.js") for agent in PLUGIN_CACHES
+                      for root in plugin_dirs(agent)
+                      if os.path.isfile(os.path.join(root, "cli", "dist", "bin.js"))),
+                     key=cli_version)
     node = shutil.which("node")
     if bundled and node:
         return [node, bundled[-1]]
     path = shutil.which("screenrig")
     return [path] if path else None
+
+
+def cli_version(path):
+    root = os.path.dirname(os.path.dirname(os.path.dirname(path)))
+    version = os.path.basename(root)
+    # Grok names installations with a hash, keeping the version in the manifest.
+    try:
+        with open(os.path.join(root, ".claude-plugin", "plugin.json")) as f:
+            version = json.load(f).get("version") or version
+    except (OSError, ValueError):
+        pass
+    return [int(x) if x.isdigit() else 0 for x in version.split(".")]
 
 
 def renew_token():
@@ -153,10 +190,9 @@ def list_projects():
 
 
 def onboarding():
-    """What a first run still needs: the screenRIG plugin for the default agent, then a sign-in."""
-    agent = default_agent()
-    cache = PLUGIN_CACHES.get(agent)
-    plugin = bool(cache and glob.glob(os.path.join(cache, "*", "skills")))
+    """Use an installed agent integration; offer installation only when needed."""
+    agent = panel_agent()
+    plugin = bool(installed_plugin_dirs(agent))
     try:
         cfg = load_config()
         signed_in = bool(cfg.get("token") or cfg.get("identity_token"))
@@ -168,8 +204,8 @@ def onboarding():
 
 
 def install_plugin():
-    """Install the official screenRIG plugin (skill and bundled CLI) into the default agent, when asked."""
-    agent = default_agent()
+    """Install the official screenRIG plugin into the selected available agent, when asked."""
+    agent = panel_agent()
     steps = PLUGIN_INSTALL.get(agent)
     if not steps:
         raise Problem("Install the screenRIG plugin for %s from %s" % (agent, PLUGIN_SOURCE.removesuffix(".git")))
@@ -571,14 +607,13 @@ def pick_file():
 
 # --------------------------------------------------------------- agent chat
 #
-# A headless session with the agent `omarchy default agent` names, resumed on
+# A headless session with an installed agent integration, resumed on
 # every message. Events are normalized to one JSON line each:
 #   {"kind": "text", "text"} {"kind": "tool", "id", "title", "status", "output"}
 #   {"kind": "error", "text"} {"kind": "session", "agent", "session"} {"kind": "done", "ok"}
 # and the transcript is kept beside the session id so the panel can show it again.
 
 AGENT_DIR = os.path.join(STATE, "agent")
-AGENT_NAMES = {"claude": "Claude Code", "codex": "Codex"}
 
 
 def default_agent():
@@ -676,8 +711,10 @@ def agent_command(agent, session, text):
     if agent == "claude":
         cmd = ["claude", "-p", text, "--output-format", "stream-json", "--verbose", "--permission-mode", "auto"]
         return cmd + (["--resume", session] if session else [])
-    raise Problem("The panel chat runs Claude Code or Codex; the default agent is %s. Change it with "
-                  "`omarchy default agent claude` or `omarchy default agent codex`." % agent)
+    if agent == "grok":
+        cmd = ["grok", "-p", text, "--output-format", "streaming-messages-json", "--permission-mode", "auto"]
+        return cmd + (["--resume", session] if session else [])
+    raise Problem("Install Claude Code, Codex or Grok and the screenRIG plugin to use the panel chat.")
 
 
 def normalize(agent, event, turn):
@@ -739,7 +776,7 @@ def normalize(agent, event, turn):
 
 
 def agent_send(text):
-    agent = default_agent()
+    agent = panel_agent()
     state = agent_state()
     session = state.get("session") if state.get("agent") == agent else None
     command = agent_command(agent, session, text)
@@ -812,7 +849,7 @@ def agent_history():
                     pass
     except OSError:
         pass
-    agent = default_agent()
+    agent = panel_agent()
     return {"ok": True, "agent": agent, "name": AGENT_NAMES.get(agent, agent), "entries": entries[-300:]}
 
 
