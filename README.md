@@ -1,8 +1,13 @@
 # screenRIG for Omarchy
 
-Your [screenRIG](https://screenrig.ai) signage screens on the Omarchy desktop:
-see every screen, cast your desktop or an app window live to the TVs around
-you, and ask your coding agent to change what plays.
+**[screenRIG](https://screenrig.ai) is free digital signage driven by your AI
+agent.** Tell Claude Code, Codex or another agent what to show, and it puts
+menus, dashboards, announcements, photos, video and live web pages on any TV,
+kiosk or display, with 200+ ready-made apps and a Player for every screen.
+
+This plugin brings your screenRIG screens to the Omarchy desktop: see every
+screen, cast your desktop or an app window live to the TVs around you, and ask
+your coding agent to change what plays.
 
 ![The screenRIG panel on Omarchy](preview.png)
 
