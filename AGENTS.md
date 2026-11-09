@@ -18,3 +18,13 @@ Rules:
 - No symlinks inside the plugin folder (`omarchy plugin validate`).
 - Never print tokens, fleet links, pairing codes or `Authorization` headers.
 - Gate: `python3 -m unittest discover -s tests` and `omarchy plugin validate .`.
+
+UI:
+
+- Check every change from a screenshot of the real panel, not the QML.
+- Size each view to its content; one primary action per view; no ellipses on
+  buttons; hide tabs that are not ready.
+- While a cast runs, its status and Stop replace the picker, and Stop stays on
+  every tab. Remember the last tab, source and screens.
+- Theme tokens only (`Color`, `Style`); motion through `root.d()` with
+  ease-out; pulse only for attention states.
