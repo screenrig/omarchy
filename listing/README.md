@@ -49,5 +49,4 @@ The screenshots show demo content (project "Acme HQ").
 
 `submission.md` is the issue body for
 `gh issue create --repo omacom/omarchy-plugin-marketplace --title "[Plugin]: screenRIG" --body-file listing/submission.md`.
-Every checklist item is the owner's confirmation: tick them only after the
-owner has confirmed each one.
+The owner confirmed every checklist item on 2026-11-08.

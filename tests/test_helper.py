@@ -41,6 +41,11 @@ class MenuMerge(unittest.TestCase):
         self.assertEqual(menu["screenrig.playlists.pl_1"]["action"],
                          "xdg-open https://screenrig.ai/dashboard/playlists/pl_1")
 
+    def test_comment_only_file_keeps_its_comments(self):
+        merged = helper.merge_menu("// my notes\n", helper.menu_rows(SNAP))
+        self.assertTrue(merged.startswith("// my notes\n{"))
+        self.assertEqual(parse_jsonc(merged)["screenrig.screens.scr_A"]["label"], "Lobby TV")
+
     def test_merge_is_idempotent_and_replaces_block(self):
         once = helper.merge_menu(USER_MENU, helper.menu_rows(SNAP))
         self.assertEqual(helper.merge_menu(once, helper.menu_rows(SNAP)), once)

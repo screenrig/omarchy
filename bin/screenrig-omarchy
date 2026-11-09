@@ -1624,8 +1624,8 @@ def merge_menu(text, rows):
         del lines[start:end + 1]
     brace = next((i for i, l in enumerate(lines) if l.strip().startswith("{")), None)
     if brace is None:
-        lines = ["{", "}"]
-        brace = 0
+        lines += ["{", "}"]
+        brace = len(lines) - 2
     block = render_block(rows)
     rest = "\n".join(l for l in lines[brace + 1:] if not l.strip().startswith("//"))
     if not re.search(r'"\s*:', rest):
