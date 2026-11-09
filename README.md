@@ -1,25 +1,33 @@
 # screenRIG for Omarchy
 
-Your [screenRIG](https://screenrig.ai) screens on the Omarchy desktop.
+Your [screenRIG](https://screenrig.ai) signage screens on the Omarchy desktop:
+see every screen, cast your desktop or an app window live to the TVs around
+you, and ask your coding agent to change what plays.
 
-- **Bar chip**: the screenRIG mark; a red dot when a screen drops, credits run
-  low or a cast is live. Click for the panel, right-click to cast a capture,
-  middle-click to stop a live cast.
+![The screenRIG panel on Omarchy](preview.png)
+
+## What it does
+
+- **Bar chip**: the screenRIG mark in your bar, with a red dot when a screen
+  drops, credits run low or a cast is live. Click for the panel, right-click to
+  cast a region capture, middle-click to stop a live cast.
 - **Screens**: every screen with its latest screenshot, what it plays and when
-  it was last seen; reload, switch playlist, turn the display off, override
-  for a while, take a fresh screenshot, restart, open in the dashboard.
+  it was last seen. Reload, switch playlist, turn the display off, override
+  for a while, take a fresh screenshot, restart, or open it in the dashboard.
 - **Cast**: a live cast of your desktop or one app window to Android and Linux
-  Players on the same network, picked from live thumbnails with the arrow keys
-  and Return; or a region capture, the clipboard (an https link or an image) or
-  a file, for 5 to 60 minutes. Files also open with "Cast to a screenRIG
-  screen" from the file manager.
-- **Agent**: a chat with your default coding agent (Claude Code or Codex) using
+  Players on your network, picked from live thumbnails with the arrow keys and
+  Return, until you stop it or for a set time; or a region capture, the
+  clipboard (an https link or an image) or a file, for 5 to 60 minutes.
+- **Agent**: a chat with your default coding agent (Claude Code or Codex) and
   the screenRIG skill, resumed across messages.
-- **Project switcher** in the panel header, and a screenRIG section in the
-  Omarchy menu with every screen and playlist searchable.
-- **Notifications**: a screen goes offline or comes back, a publish reaches
-  its screens, credits run low, an ad booking needs your review, a live cast
-  starts or stops.
+- **Project switcher**, a screenRIG section in the Omarchy menu with every
+  screen and playlist searchable, and notifications when a screen goes offline
+  or comes back, a publish reaches its screens, credits run low, an ad booking
+  needs review, or a live cast starts or stops.
+
+| Cast live | While casting | Agent |
+|---|---|---|
+| ![Cast tab](listing/images/cast.png) | ![Live cast status](listing/images/casting.png) | ![Agent chat](listing/images/agent.png) |
 
 ## Install
 
@@ -27,17 +35,52 @@ Your [screenRIG](https://screenrig.ai) screens on the Omarchy desktop.
 omarchy plugin add https://github.com/screenrig/omarchy --enable
 ```
 
-or from a checkout, `./install.sh` (`./install.sh --uninstall` removes it).
+Then sign in to screenRIG with its CLI: install the
+[screenRIG plugin](https://github.com/screenrig/plugin) for your agent and run
+`screenrig login`. The plugin uses that sign-in
+(`~/.config/screenrig/config.json`) and lets the CLI renew it.
 
-It uses the screenRIG CLI's sign-in (`~/.config/screenrig/config.json`): sign
-in with `screenrig login` after installing the
-[screenRIG plugin](https://github.com/screenrig/plugin) for your agent.
+## Remove
 
-Live casts need `gpu-screen-recorder` and `ffmpeg`; the plugin downloads a
-checksummed `mediamtx` on the first cast and serves RTSP over TCP on port 8554.
-With ufw on, the first cast adds a rule for that port from your LAN. Window
-casts answer xdg-desktop-portal-hyprland's picker for the window picked in the
-panel and run your own picker for every other screen share.
+```sh
+screenrig-omarchy teardown && omarchy plugin remove screenrig.omarchy
+```
+
+`teardown` stops a live cast and undoes everything below; from a checkout,
+`./install.sh --uninstall` does both steps.
+
+## What it changes on your system
+
+On first load it adds, and `teardown` removes:
+
+- links `screenrig-omarchy` and `screenrig-share-picker` in `~/.local/bin`;
+- a generated, marked block of screenRIG rows in
+  `~/.config/omarchy/extensions/omarchy-menu.jsonc` (your own rows are kept);
+- two `.desktop` entries (the panel, and "Cast to a screenRIG screen" for files)
+  and a theme hook in `~/.config/omarchy/hooks/theme-set.d/`.
+
+Live casting changes two more things, only after you press **Allow** in the
+Cast tab:
+
+- with ufw on, a rule letting your LAN subnet reach TCP 8554 (the stream);
+- for window casts, xdg-desktop-portal-hyprland's `custom_picker_binary`
+  points at `screenrig-share-picker`, which answers the portal for the window
+  you picked in the panel and runs your previous picker for every other screen
+  share. The previous value is kept and restored by `teardown`.
+
+## Requirements
+
+- Omarchy 4.5 (Quickshell shell), Python 3.
+- The screenRIG CLI, signed in (bundled with the screenRIG agent plugin).
+- `grim`, `slurp`, `wl-clipboard`, `zenity` for captures, the clipboard and
+  files.
+- Live casting: `gpu-screen-recorder` and `ffmpeg`. On the first cast the
+  plugin downloads [mediamtx](https://github.com/bluenviron/mediamtx) v1.21.3,
+  checks it against the release's published SHA-256 and keeps it in
+  `~/.local/share/screenrig-omarchy/bin`; it serves RTSP over TCP on port 8554.
+  Screens reach it on the same network: Android and Linux Players.
+- Agent: Claude Code or Codex as your Omarchy default agent
+  (`omarchy default agent`).
 
 ## Keybindings
 

@@ -985,19 +985,6 @@ def player_forget():
     return "This machine's fleet link is deleted; its screen stays in the project"
 
 
-def player_install():
-    prefix = os.path.join(HOME, ".local/opt/screenrig-player")
-    work = os.path.join(CACHE, "player-install")
-    os.makedirs(work, exist_ok=True)
-    script = os.path.join(work, "install.sh")
-    urllib.request.urlretrieve("https://screenrig.ai/linux/install.sh", script)
-    proc = subprocess.run(["sh", script, "--prefix", prefix], capture_output=True, text=True, timeout=600)
-    if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout or "").strip().splitlines()
-        raise Problem("Installing the Player failed: %s" % (detail[-1] if detail else proc.returncode))
-    return "Installed the screenRIG Player for Linux"
-
-
 def player_status():
     running = bool(player_pids())
     provisioned = False
@@ -1121,18 +1108,71 @@ def mediamtx_config():
     return path
 
 
-def ensure_firewall(subnet):
-    """Let the LAN reach the stream port when ufw is on; nothing else is opened."""
+def firewall_state(subnet):
+    """ok, needed, inactive (no ufw) or no-sudo (ufw on, but sudo asks for a password)."""
     if subprocess.run(["systemctl", "is-active", "--quiet", "ufw"]).returncode != 0:
-        return
+        return "inactive"
     status = subprocess.run(["sudo", "-n", "ufw", "status"], capture_output=True, text=True)
     if status.returncode != 0:
-        raise Problem("The firewall needs a rule for port %d from %s; run: sudo ufw allow from %s to any port %d proto tcp"
-                      % (LIVE_PORT, subnet, subnet, LIVE_PORT))
+        return "no-sudo"
     if re.search(r"^%d/tcp\s+ALLOW\s+%s" % (LIVE_PORT, re.escape(subnet)), status.stdout, re.M):
-        return
-    subprocess.run(["sudo", "-n", "ufw", "allow", "from", subnet, "to", "any", "port", str(LIVE_PORT),
-                    "proto", "tcp", "comment", "screenRIG live cast"], capture_output=True, check=True)
+        return "ok"
+    return "needed"
+
+
+def picker_ready():
+    try:
+        with open(XDPH_CONF) as f:
+            return bool(re.search(r"^\s*custom_picker_binary\s*=\s*%s\s*$" % re.escape(PICKER_LINK), f.read(), re.M))
+    except OSError:
+        return False
+
+
+def live_setup_status():
+    subnet = lan_subnet(lan_ip())
+    return {"ok": True, "firewall": firewall_state(subnet), "picker": picker_ready(), "subnet": subnet, "port": LIVE_PORT}
+
+
+def live_unsetup():
+    """Undo live-setup: drop the ufw rule (when sudo needs no password) and restore the picker."""
+    done = []
+    try:
+        subnet = lan_subnet(lan_ip())
+    except Problem:
+        subnet = None
+    if subnet and firewall_state(subnet) == "ok":
+        subprocess.run(["sudo", "-n", "ufw", "delete", "allow", "from", subnet, "to", "any", "port", str(LIVE_PORT),
+                        "proto", "tcp"], capture_output=True)
+        done.append("ufw rule removed")
+    original = os.path.join(STATE, "xdph-original-picker")
+    if picker_ready() and os.path.exists(original):
+        with open(original) as f:
+            previous = f.read().strip() or "hyprland-share-picker"
+        with open(XDPH_CONF) as f:
+            text = f.read()
+        text = re.sub(r"^(\s*custom_picker_binary\s*=\s*).*$", lambda m: m.group(1) + previous, text, count=1, flags=re.M)
+        with open(XDPH_CONF, "w") as f:
+            f.write(text)
+        subprocess.run(["systemctl", "--user", "try-restart", "xdg-desktop-portal-hyprland"], capture_output=True)
+        done.append("screen-share picker restored")
+    return "; ".join(done) or "Nothing to undo"
+
+
+def live_setup(firewall=True, picker=True):
+    """The changes live casting needs, made only after the person allows them in the panel."""
+    subnet = lan_subnet(lan_ip())
+    done = []
+    state = firewall_state(subnet)
+    if firewall and state == "needed":
+        subprocess.run(["sudo", "-n", "ufw", "allow", "from", subnet, "to", "any", "port", str(LIVE_PORT),
+                        "proto", "tcp", "comment", "screenRIG live cast"], capture_output=True, check=True)
+        done.append("ufw allows TCP %d from %s" % (LIVE_PORT, subnet))
+    elif firewall and state == "no-sudo":
+        raise Problem("Run once: sudo ufw allow from %s to any port %d proto tcp comment 'screenRIG live cast'"
+                      % (subnet, LIVE_PORT))
+    if picker and setup_picker():
+        done.append("window casts answer the screen-share picker")
+    return "Live casting is set up" + (": " + "; ".join(done) if done else "")
 
 
 def solid_png(width=1280, height=720, rgb=(11, 12, 14)):
@@ -1247,7 +1287,10 @@ def live_start(source, screens, minutes, label):
     if not screens:
         raise Problem("Pick at least one screen on this network.")
     ip = lan_ip()
-    ensure_firewall(lan_subnet(ip))
+    if firewall_state(lan_subnet(ip)) in ("needed", "no-sudo"):
+        raise Problem("Allow live casting in the Cast tab first: screens need to reach this laptop.")
+    if source.startswith("window:") and not picker_ready():
+        raise Problem("Allow window casting in the Cast tab first.")
     os.makedirs(LIVE_DIR, mode=0o700, exist_ok=True)
     logs = os.path.join(CACHE, "live")
     os.makedirs(logs, exist_ok=True)
@@ -1484,9 +1527,31 @@ def setup():
     if place_file(os.path.join(root, "hooks", "theme-set"),
                   os.path.join(HOME, ".config", "omarchy", "hooks", "theme-set.d", "50-screenrig")):
         changed.append("theme hook")
-    if setup_picker():
-        changed.append("screen-share picker")
     return "Set up: " + ", ".join(changed) if changed else "Already set up"
+
+
+def teardown():
+    """Undo everything the plugin set up, before `omarchy plugin remove screenrig.omarchy`."""
+    done = []
+    if live_status().get("live"):
+        live_stop()
+        done.append("live cast stopped")
+    undone = live_unsetup()
+    if undone != "Nothing to undo":
+        done.append(undone)
+    if menu_remove():
+        done.append("menu rows removed")
+    apps = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local", "share"), "applications")
+    for path in (os.path.join(apps, "screenrig-omarchy.desktop"), os.path.join(apps, "screenrig-send.desktop"),
+                 os.path.join(HOME, ".config", "omarchy", "hooks", "theme-set.d", "50-screenrig")):
+        if os.path.exists(path):
+            os.remove(path)
+            done.append(os.path.basename(path) + " removed")
+    for link in (os.path.join(HOME, ".local", "bin", "screenrig-omarchy"), PICKER_LINK):
+        if os.path.islink(link):
+            os.remove(link)
+            done.append(os.path.basename(link) + " unlinked")
+    return "; ".join(done) or "Nothing to undo"
 
 
 # ---------------------------------------------------------------------- menu
@@ -1874,10 +1939,8 @@ def main(argv):
                 notify_result = True
             elif sub == "forget":
                 msg = player_forget()
-            elif sub == "install":
-                msg = player_install()
             else:
-                raise Problem("player status|start|stop|toggle|forget|install")
+                raise Problem("player status|start|stop|toggle|forget")
         elif cmd == "menu-sync":
             changed = menu_sync(snapshot())
             msg = "Menu updated" if changed else "Menu already current"
@@ -1909,6 +1972,15 @@ def main(argv):
             return live_keepalive()
         elif cmd == "setup":
             msg = setup()
+        elif cmd == "live-setup-status":
+            emit(live_setup_status())
+            return 0
+        elif cmd == "live-setup":
+            msg = live_setup()
+        elif cmd == "live-unsetup":
+            msg = live_unsetup()
+        elif cmd == "teardown":
+            msg = teardown()
         elif cmd == "monitors":
             emit({"ok": True, "monitors": monitors()})
             return 0

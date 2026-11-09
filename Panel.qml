@@ -198,6 +198,7 @@ Item {
     refreshTheme()
     projectMenu = false
     if (svc) { svc.loadProjects(); svc.loadChat(); svc.refreshLive(); svc.loadLiveTargets() }
+    refreshLiveSetup()
     refreshLiveSources()
     opened = true
     Qt.callLater(function() {
@@ -435,12 +436,28 @@ Item {
     sendSelected = next
   }
 
+  // Live casting changes this laptop only after the person allows it here.
+  property var liveSetup: ({})
+  readonly property bool liveWindowPicked: liveSource.indexOf("window:") === 0
+  readonly property bool needsFirewall: liveSetup.firewall === "needed" || liveSetup.firewall === "no-sudo"
+  readonly property bool needsPicker: liveWindowPicked && liveSetup.picker === false
+  readonly property bool needsConsent: sendSource === "live" && (needsFirewall || needsPicker)
+  function refreshLiveSetup() {
+    if (svc) svc.run(["live-setup-status"], function(ok, message, answer) { if (ok) root.liveSetup = answer })
+  }
+  function allowLive() {
+    svc.run(["live-setup"], function(ok, message) {
+      svc.report(ok, message)
+      root.refreshLiveSetup()
+    })
+  }
+
   function goLive() {
     var allowed = {}
     var list = castTargets()
     for (var i = 0; i < list.length; i++) allowed[list[i].id] = true
     var ids = selectedIds().filter(function(id) { return allowed[id] })
-    if (!ids.length || sending || liveSource === "") return
+    if (!ids.length || sending || liveSource === "" || needsConsent) return
     sending = true
     svc.report(true, "Going live on " + ids.length + " screen" + (ids.length === 1 ? "" : "s"))
     svc.liveStart(liveSource, liveLabel, ids, liveMinutes, function(ok, message) {
@@ -1842,6 +1859,48 @@ Item {
                 }
               }
 
+              // What live casting changes on this laptop, allowed once.
+              Rectangle {
+                visible: root.needsConsent && !root.casting
+                Layout.fillWidth: true
+                implicitHeight: consentRow.implicitHeight + Style.space(24)
+                radius: root.rTile
+                color: Util.alpha(root.accent, 0.08)
+                border.color: Util.alpha(root.accent, 0.35)
+                RowLayout {
+                  id: consentRow
+                  anchors.fill: parent
+                  anchors.margins: Style.space(12)
+                  anchors.leftMargin: Style.space(16)
+                  spacing: Style.space(14)
+                  Label { text: "󰒃"; color: root.accent; font.pixelSize: root.titleSize; Layout.alignment: Qt.AlignTop }
+                  ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: Style.space(4)
+                    Label { text: "Allow live casting on this laptop"; font.bold: true }
+                    Label {
+                      visible: root.needsFirewall
+                      Layout.fillWidth: true
+                      meta: true
+                      wrapMode: Text.Wrap
+                      text: "The firewall (ufw) lets screens on " + (root.liveSetup.subnet || "your network") + " reach TCP " + (root.liveSetup.port || 8554)
+                        + " here." + (root.liveSetup.firewall === "no-sudo" ? " This needs your password once: Allow shows the command." : "")
+                    }
+                    Label {
+                      visible: root.needsPicker
+                      Layout.fillWidth: true
+                      meta: true
+                      wrapMode: Text.Wrap
+                      text: "Window casts answer the desktop's screen-share picker for the window you pick here; your own picker still handles every other screen share. Uninstalling restores it."
+                    }
+                  }
+                  PrimaryButton {
+                    iconText: "󰄬"; text: "Allow"
+                    onClicked: root.allowLive()
+                  }
+                }
+              }
+
               Hairline { visible: !root.casting }
 
               RowLayout {
@@ -1869,7 +1928,7 @@ Item {
                   iconText: liveMode ? "󰑋" : "󰄘"
                   text: root.sending ? (liveMode ? "Going live" : "Casting")
                     : (n === 0 ? "Pick screens" : (liveMode ? "Go live on " : "Cast to ") + n + " screen" + (n === 1 ? "" : "s"))
-                  enabled: n > 0 && !root.sending && (liveMode ? root.liveSource !== "" : root.sendKind !== "")
+                  enabled: n > 0 && !root.sending && (liveMode ? root.liveSource !== "" && !root.needsConsent : root.sendKind !== "")
                   onClicked: liveMode ? root.goLive() : root.doSend()
                 }
               }
@@ -1947,25 +2006,13 @@ Item {
                 }
               }
 
-              // No Player yet: install it first.
-              RowLayout {
-                Layout.fillWidth: true
-                spacing: Style.space(10)
+              // No Player yet: point at the Linux Player download.
+              Label {
                 visible: !root.playerInfo.native
-                Label { Layout.fillWidth: true; meta: true; text: "The screenRIG Player for Linux is not installed for this user." }
-                PrimaryButton {
-                  iconText: "󰇚"; text: root.playerBusy ? "Installing" : "Install the Player"
-                  busy: root.playerBusy
-                  enabled: !root.playerBusy
-                  onClicked: {
-                    root.playerBusy = true
-                    root.svc.run(["player", "install"], function(ok, message) {
-                      root.playerBusy = false
-                      root.svc.report(ok, message)
-                      root.refreshPlayer()
-                    })
-                  }
-                }
+                Layout.fillWidth: true
+                meta: true
+                wrapMode: Text.Wrap
+                text: "Install the screenRIG Player for Linux from screenrig.ai/docs/players to run it here."
               }
 
               RowLayout {
