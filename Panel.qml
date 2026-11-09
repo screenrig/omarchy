@@ -6,6 +6,7 @@ import Quickshell.Hyprland
 import Quickshell.Io
 import Quickshell.Wayland
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 
 // The screenRIG panel: screens grid, send to screens, Player on this machine,
@@ -121,8 +122,8 @@ Item {
   }
 
   readonly property var svc: service
-  readonly property color fg: Color.popups.text
-  readonly property color base: Qt.rgba(Color.popups.background.r, Color.popups.background.g, Color.popups.background.b, 1)
+  readonly property color fg: Commons.Color.popups.text
+  readonly property color base: Qt.rgba(Commons.Color.popups.background.r, Commons.Color.popups.background.g, Commons.Color.popups.background.b, 1)
   readonly property color surface: Qt.darker(base, 1.08)
   readonly property color surfaceTop: Qt.tint(surface, Util.alpha(fg, 0.035))
   readonly property color raised: Qt.tint(surface, Util.alpha(fg, 0.045))
@@ -130,7 +131,7 @@ Item {
   readonly property color line: Util.alpha(fg, 0.10)
   readonly property color lineStrong: Util.alpha(fg, 0.18)
   readonly property color dim: Util.alpha(fg, 0.56)
-  readonly property color accent: Color.accent
+  readonly property color accent: Commons.Color.accent
   readonly property color onAccent: Qt.darker(base, 1.4)
   readonly property color onlineColor: "#4cc38a"
   readonly property color offlineColor: "#ef5f5f"
@@ -978,7 +979,7 @@ Item {
               Label {
                 visible: !!root.svc && !!root.svc.credits && !!root.svc.credits.low
                 text: "· credits low"
-                color: Color.urgent
+                color: Commons.Color.urgent
               }
               Item { Layout.fillWidth: true }
               Segmented {
@@ -1540,6 +1541,8 @@ Item {
             View {
               id: castView
               name: "cast"
+              Layout.fillHeight: true
+              Layout.minimumHeight: 0
 
               Segmented {
                 visible: !root.casting
@@ -1701,11 +1704,15 @@ Item {
               RowLayout {
                 visible: !root.casting
                 Layout.fillWidth: true
+                Layout.fillHeight: true
+                Layout.minimumHeight: 0
                 spacing: root.pad
 
                 // What to cast: live thumbnails, or the captured image, link or file.
                 ColumnLayout {
                   Layout.fillWidth: true
+                  Layout.fillHeight: true
+                  Layout.minimumHeight: 0
                   Layout.alignment: Qt.AlignTop
                   Layout.horizontalStretchFactor: root.sendSource === "live" ? 3 : 1
                   Layout.preferredWidth: root.sendSource === "live" ? 3 : 1
@@ -1723,6 +1730,10 @@ Item {
                       var list = root.liveSourceList
                       for (var i = 0; i < list.length; i++) if (list[i].id === root.liveSource) { currentIndex = i; return }
                     }
+                    function revealCurrent() {
+                      if (currentIndex >= 0) positionViewAtIndex(currentIndex, GridView.Contain)
+                    }
+                    onHeightChanged: Qt.callLater(revealCurrent)
                     Connections {
                       target: root
                       function onLiveSourceChanged() { sourceGrid.syncIndex() }
@@ -1732,10 +1743,14 @@ Item {
                     onCurrentIndexChanged: {
                       var item = root.liveSourceList[currentIndex]
                       if (item && item.id !== root.liveSource) { root.liveSource = item.id; root.liveLabel = item.title }
+                      Qt.callLater(revealCurrent)
                     }
                     Keys.onReturnPressed: root.goLive()
                     Keys.onEnterPressed: root.goLive()
                     Layout.fillWidth: true
+                    // Leave room for setup, consent and the Cast action; scroll the sources.
+                    Layout.fillHeight: true
+                    Layout.minimumHeight: 0
                     Layout.preferredHeight: cellHeight * Math.max(1, Math.min(3, Math.ceil(count / columns)))
                     clip: true
                     boundsBehavior: Flickable.StopAtBounds
@@ -1823,6 +1838,8 @@ Item {
                   Well {
                     visible: root.sendSource !== "live"
                     Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    Layout.minimumHeight: 0
                     Layout.preferredHeight: width * 9 / 16
                     radius: root.rTile
                     Rectangle { anchors.fill: parent; color: root.well }
@@ -1872,6 +1889,8 @@ Item {
                 // Where to show it.
                 ColumnLayout {
                   Layout.fillWidth: true
+                  Layout.fillHeight: true
+                  Layout.minimumHeight: 0
                   Layout.alignment: Qt.AlignTop
                   Layout.horizontalStretchFactor: root.sendSource === "live" ? 2 : 1
                   Layout.preferredWidth: root.sendSource === "live" ? 2 : 1
@@ -1901,6 +1920,8 @@ Item {
                   }
                   ListView {
                     Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    Layout.minimumHeight: 0
                     Layout.preferredHeight: Math.min(contentHeight, (Math.ceil(bodyMetrics.height) + Style.space(20)) * 12)
                     clip: true
                     spacing: Style.space(2)
@@ -2405,7 +2426,7 @@ Item {
                   Rectangle {
                     anchors.fill: parent
                     radius: root.rTile
-                    color: Color.background
+                    color: Commons.Color.background
                     border.color: root.line
                     layer.enabled: true
                     layer.effect: MultiEffect { shadowEnabled: true; shadowColor: "black"; shadowBlur: 0.7; shadowOpacity: 0.5; shadowVerticalOffset: Style.space(8) }
@@ -2414,7 +2435,7 @@ Item {
                     anchors.fill: parent
                     anchors.margins: root.pad
                     spacing: Style.space(6)
-                    Label { text: "VISITORS TODAY"; color: Util.alpha(Color.foreground, 0.7); font.letterSpacing: 1.2; meta: true }
+                    Label { text: "VISITORS TODAY"; color: Util.alpha(Commons.Color.foreground, 0.7); font.letterSpacing: 1.2; meta: true }
                     RowLayout {
                       Layout.fillWidth: true
                       Layout.fillHeight: true
@@ -2423,12 +2444,12 @@ Item {
                         spacing: Style.space(4)
                         Text {
                           text: Math.round(1284 * previewCard.grow).toLocaleString(Qt.locale(), "f", 0)
-                          color: Color.foreground
+                          color: Commons.Color.foreground
                           font.family: root.fontFamily
                           font.pixelSize: root.titleSize * 3.2
                           font.bold: true
                         }
-                        Label { text: "▲ 12% vs last week"; color: Color.accent }
+                        Label { text: "▲ 12% vs last week"; color: Commons.Color.accent }
                       }
                       Item { Layout.fillWidth: true }
                       Row {
@@ -2443,7 +2464,7 @@ Item {
                             width: Style.space(16)
                             height: Style.space(96) * modelData * Math.max(0, Math.min(1, previewCard.grow * 1.6 - index * 0.12))
                             radius: Style.space(3)
-                            color: index === 5 ? Color.accent : Util.alpha(Color.foreground, 0.22)
+                            color: index === 5 ? Commons.Color.accent : Util.alpha(Commons.Color.foreground, 0.22)
                           }
                         }
                       }
@@ -2455,9 +2476,9 @@ Item {
                   spacing: Style.space(12)
                   Repeater {
                     model: [
-                      { name: "Accent", color: Color.accent },
-                      { name: "Background", color: Color.background },
-                      { name: "Text", color: Color.foreground }
+                      { name: "Accent", color: Commons.Color.accent },
+                      { name: "Background", color: Commons.Color.background },
+                      { name: "Text", color: Commons.Color.foreground }
                     ]
                     RowLayout {
                       required property var modelData
@@ -2696,7 +2717,7 @@ Item {
               spacing: Style.space(10)
               PulseDot {
                 anchors.verticalCenter: parent.verticalCenter
-                color: root.svc && root.svc.statusOk && root.svc.connected ? root.onlineColor : Color.urgent
+                color: root.svc && root.svc.statusOk && root.svc.connected ? root.onlineColor : Commons.Color.urgent
                 pulse: true
               }
               Label {
