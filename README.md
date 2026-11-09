@@ -42,9 +42,11 @@ your coding agent to change what plays.
 omarchy plugin add https://github.com/screenrig/omarchy --enable
 ```
 
-Then sign in to screenRIG with its CLI: install the
-[screenRIG plugin](https://github.com/screenrig/plugin) for your agent and run
-`screenrig login`. The plugin uses that sign-in
+On first open the panel sets up the rest, one button each: **Install** adds
+the official [screenRIG plugin](https://github.com/screenrig/plugin) (its
+skill and CLI) to your default agent, Claude Code or Codex, and **Sign in**
+approves this laptop at screenrig.ai. Already have the plugin and
+`screenrig login`? The panel uses that sign-in
 (`~/.config/screenrig/config.json`) and lets the CLI renew it.
 
 ## Remove
@@ -66,6 +68,11 @@ On first load it adds, and `teardown` removes:
 - two `.desktop` entries (the panel, and "Cast to a screenRIG screen" for files)
   and a theme hook in `~/.config/omarchy/hooks/theme-set.d/`.
 
+**Install** on the first-run card runs your agent's own plugin install
+(`claude plugin install screenrig@screenrig` or `codex plugin add
+screenrig@screenrig`, from github.com/screenrig/plugin); remove it with that
+agent's plugin commands.
+
 Live casting changes two more things, only after you press **Allow** in the
 Cast tab:
 
@@ -78,7 +85,7 @@ Cast tab:
 ## Requirements
 
 - Omarchy 4.5 (Quickshell shell), Python 3.
-- The screenRIG CLI, signed in (bundled with the screenRIG agent plugin).
+- The screenRIG agent plugin and its bundled CLI (Node.js), signed in: the first-run card installs both.
 - `grim`, `slurp`, `wl-clipboard`, `zenity` for captures, the clipboard and
   files.
 - Live casting: `gpu-screen-recorder` and `ffmpeg`. On the first cast the

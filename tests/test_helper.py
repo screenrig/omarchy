@@ -183,5 +183,22 @@ class LiveCast(unittest.TestCase):
         self.assertTrue(png.startswith(b"\x89PNG\r\n\x1a\n") and png.endswith(b"IEND\xaeB`\x82"))
 
 
+class PluginLookup(unittest.TestCase):
+    def test_newest_bundled_cli_across_agents(self):
+        import tempfile
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            caches = {"claude": os.path.join(tmp, "claude"), "codex": os.path.join(tmp, "codex")}
+            for root, version in (("claude", "26.10.1155"), ("codex", "26.11.275"), ("codex", "26.9.2")):
+                path = os.path.join(caches[root], version, "cli", "dist")
+                os.makedirs(path)
+                open(os.path.join(path, "bin.js"), "w").close()
+            with mock.patch.object(helper, "PLUGIN_CACHES", caches), \
+                 mock.patch.dict(os.environ, {"SCREENRIG_CLI": ""}), \
+                 mock.patch.object(helper.shutil, "which", return_value="/usr/bin/node"):
+                self.assertEqual(helper.cli_command(),
+                                 ["/usr/bin/node", os.path.join(caches["codex"], "26.11.275", "cli", "dist", "bin.js")])
+
+
 if __name__ == "__main__":
     unittest.main()

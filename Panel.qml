@@ -198,6 +198,7 @@ Item {
     refreshTheme()
     projectMenu = false
     if (svc) { svc.loadProjects(); svc.loadChat(); svc.refreshLive(); svc.loadLiveTargets() }
+    refreshOnboarding()
     refreshLiveSetup()
     refreshLiveSources()
     opened = true
@@ -437,6 +438,32 @@ Item {
   }
 
   // Live casting changes this laptop only after the person allows it here.
+  // First run: the screenRIG plugin for the default agent, then a sign-in.
+  property var onboarding: ({})
+  property bool installingPlugin: false
+  readonly property bool needsPlugin: onboarding.ok === true && !(onboarding.plugin && onboarding.cli)
+  readonly property bool needsSignIn: onboarding.ok === true && !onboarding.signed_in
+  readonly property bool firstRun: needsPlugin || needsSignIn
+  function refreshOnboarding() {
+    if (svc) svc.run(["onboarding"], function(ok, message, answer) { if (ok) root.onboarding = answer })
+  }
+  function installPlugin() {
+    if (installingPlugin) return
+    installingPlugin = true
+    svc.run(["install-plugin"], function(ok, message) {
+      root.installingPlugin = false
+      svc.report(ok, message)
+      root.refreshOnboarding()
+    })
+  }
+  function signIn() {
+    svc.addProject()
+  }
+  Connections {
+    target: root.svc
+    function onPendingLoginChanged() { if (root.svc && !root.svc.pendingLogin) root.refreshOnboarding() }
+  }
+
   property var liveSetup: ({})
   readonly property bool liveWindowPicked: liveSource.indexOf("window:") === 0
   readonly property bool needsFirewall: liveSetup.firewall === "needed" || liveSetup.firewall === "no-sudo"
@@ -1025,6 +1052,83 @@ Item {
                     Text { text: root.stopping ? "Stopping" : "Stop"; color: "white"; font.family: root.fontFamily; font.pixelSize: root.bodySize; font.bold: true; anchors.verticalCenter: parent.verticalCenter }
                   }
                   MouseArea { id: stripStop; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.stopCast() }
+                }
+              }
+            }
+
+            // First run: install the screenRIG plugin for the agent, then sign in.
+            Rectangle {
+              visible: root.firstRun
+              Layout.fillWidth: true
+              implicitHeight: firstCol.implicitHeight + Style.space(32)
+              radius: root.rTile
+              color: Util.alpha(root.accent, 0.08)
+              border.color: Util.alpha(root.accent, 0.35)
+              ColumnLayout {
+                id: firstCol
+                anchors.fill: parent
+                anchors.margins: Style.space(16)
+                anchors.leftMargin: Style.space(20)
+                spacing: Style.space(12)
+                Label { text: "Set up screenRIG"; font.bold: true; font.pixelSize: root.titleSize }
+                Label {
+                  Layout.fillWidth: true
+                  meta: true
+                  wrapMode: Text.Wrap
+                  text: "screenRIG is free digital signage driven by your AI agent. The panel uses the official screenRIG plugin (its skill and CLI) and your screenRIG sign-in."
+                }
+                RowLayout {
+                  Layout.fillWidth: true
+                  spacing: Style.space(14)
+                  Label { text: root.needsPlugin ? "1" : "󰄬"; color: root.needsPlugin ? root.dim : root.accent; font.bold: true; Layout.preferredWidth: Style.space(20) }
+                  ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: Style.space(2)
+                    Label { text: "Install the screenRIG plugin for " + (root.onboarding.agent_name || "your agent") }
+                    Label {
+                      Layout.fillWidth: true
+                      meta: true
+                      wrapMode: Text.Wrap
+                      text: !root.needsPlugin ? "Installed"
+                        : root.onboarding.installable
+                          ? "Runs " + (root.onboarding.agent || "the agent") + "'s plugin install from github.com/screenrig/plugin."
+                          : "Install it from github.com/screenrig/plugin, then open the panel again."
+                    }
+                  }
+                  PrimaryButton {
+                    visible: root.needsPlugin && !!root.onboarding.installable
+                    busy: root.installingPlugin
+                    iconText: "󰏗"
+                    text: root.installingPlugin ? "Installing" : "Install"
+                    enabled: !root.installingPlugin
+                    onClicked: root.installPlugin()
+                  }
+                }
+                RowLayout {
+                  Layout.fillWidth: true
+                  spacing: Style.space(14)
+                  Label { text: root.needsSignIn ? "2" : "󰄬"; color: root.needsSignIn ? root.dim : root.accent; font.bold: true; Layout.preferredWidth: Style.space(20) }
+                  ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: Style.space(2)
+                    Label { text: "Sign in to screenRIG" }
+                    Label {
+                      Layout.fillWidth: true
+                      meta: true
+                      wrapMode: Text.Wrap
+                      text: !root.needsSignIn ? "Signed in"
+                        : root.svc && root.svc.pendingLogin ? "Approve code " + root.svc.pendingLogin.code + " in the browser."
+                        : "Opens screenrig.ai in your browser to approve this laptop."
+                    }
+                  }
+                  PrimaryButton {
+                    visible: root.needsSignIn
+                    busy: !!root.svc && !!root.svc.pendingLogin
+                    iconText: "󰍂"
+                    text: root.svc && root.svc.pendingLogin ? "Open again" : "Sign in"
+                    enabled: !root.needsPlugin
+                    onClicked: root.signIn()
+                  }
                 }
               }
             }
