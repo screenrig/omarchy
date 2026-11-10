@@ -1,11 +1,24 @@
+import base64
+import hashlib
+import http.client
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import re
+import stat
+import subprocess
+import sys
 import tempfile
 import unittest
+import urllib.error
 from unittest import mock
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 loader = importlib.machinery.SourceFileLoader("helper", os.path.join(HERE, "..", "bin", "screenrig-omarchy"))
@@ -13,10 +26,19 @@ spec = importlib.util.spec_from_loader("helper", loader)
 helper = importlib.util.module_from_spec(spec)
 loader.exec_module(helper)
 
+# JavaScript's \s, which includes U+2028 and U+2029.
+JS_SPACE = "\t\n\v\f\r    -     　﻿"
+
 
 def parse_jsonc(text):
-    """The Omarchy menu strips whole-line // comments, then parses JSON."""
-    return json.loads("\n".join(l for l in text.splitlines() if not l.strip().startswith("//")))
+    """Read a menu file the way Omarchy does: MenuModel.js stripJsonc, then JSON.parse.
+
+    A JavaScript multiline ^ also matches after U+2028 and U+2029, so a line
+    separator inside a label followed by // deletes the rest of that row.
+    """
+    text = re.sub(r"(?:(?<=[\n\r  ])|\A)[%s]*//[^\n]*(?:\n|\Z)" % JS_SPACE, "", text)
+    text = re.sub(r",([%s]*[}\]])" % JS_SPACE, r"\1", text)
+    return json.loads(text)
 
 
 SNAP = {
@@ -54,6 +76,25 @@ class MenuMerge(unittest.TestCase):
         menu = parse_jsonc(helper.merge_menu(once, helper.menu_rows(fewer)))
         self.assertNotIn("screenrig.screens.scr_B", menu)
         self.assertEqual(once.count("screenrig-omarchy:begin"), 1)
+
+    def test_line_separators_in_names_survive_the_omarchy_reader(self):
+        snap = {"screens": [{"id": "scr_A", "label": "Lobby // TV", "online": True, "playing_name": "Loop //x"}],
+                "playlists": [{"id": "pl_1", "name": "Menu //board", "approved": True}]}
+        merged = helper.merge_menu(USER_MENU, helper.menu_rows(snap))
+        menu = parse_jsonc(merged)
+        self.assertIn("style.lockscreen", menu)
+        self.assertEqual(menu["screenrig.screens.scr_A"]["label"], "Lobby // TV")
+        self.assertEqual(menu["screenrig.screens.scr_A.open"]["label"], "Open Lobby // TV")
+        self.assertEqual(menu["screenrig.screens.scr_A"]["description"], "screen online Loop //x")
+        self.assertEqual(menu["screenrig.playlists.pl_1"]["label"], "Menu //board")
+        self.assertEqual(helper.merge_menu(merged, helper.menu_rows(snap)), merged)
+
+    def test_block_written_with_a_raw_line_separator_is_replaced(self):
+        bad = helper.merge_menu(USER_MENU, helper.menu_rows(SNAP)).replace("Lobby TV", "Lobby // TV")
+        with self.assertRaises(ValueError):
+            parse_jsonc(bad)
+        fixed = helper.merge_menu(bad, helper.menu_rows(SNAP))
+        self.assertEqual(parse_jsonc(fixed)["screenrig.screens.scr_A"]["label"], "Lobby TV")
 
     def test_empty_object_has_no_trailing_comma(self):
         menu = parse_jsonc(helper.merge_menu("{\n}\n", helper.menu_rows(SNAP)))
@@ -196,6 +237,334 @@ class LiveCast(unittest.TestCase):
     def test_fallback_png_is_a_png(self):
         png = helper.solid_png(4, 2)
         self.assertTrue(png.startswith(b"\x89PNG\r\n\x1a\n") and png.endswith(b"IEND\xaeB`\x82"))
+
+
+class LiveCastStart(unittest.TestCase):
+    """live_start with the recorder, mediamtx and the keep-alive replaced by idle processes."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = self.tmp.name
+        self.children, self.calls, self.probed = [], [], []
+        self.fail_on = {}
+        real_popen = subprocess.Popen
+
+        def popen(cmd, **kw):
+            if hasattr(kw.get("stdout"), "close"):
+                kw["stdout"].close()
+            if cmd[0] in self.fail_on:
+                raise self.fail_on[cmd[0]]
+            # Restores SIGINT in case the test run started with it ignored.
+            idle = "import signal, time; signal.signal(signal.SIGINT, signal.SIG_DFL); time.sleep(60)"
+            proc = real_popen([sys.executable, "-I", "-c", idle], stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, start_new_session=kw.get("start_new_session", False))
+            self.children.append((cmd, proc))
+            return proc
+
+        def api(method, path, body=None, **kw):
+            self.calls.append((method, path, body))
+            if method == "POST" and path.endswith("/playlists"):
+                if "playlist" in self.fail_on:
+                    raise self.fail_on["playlist"]
+                return {"id": "pl_cast"}
+            return {}
+
+        patches = [
+            mock.patch.object(helper, "STATE", os.path.join(root, "state")),
+            mock.patch.object(helper, "CACHE", os.path.join(root, "cache")),
+            mock.patch.object(helper, "LIVE_DIR", os.path.join(root, "state", "live")),
+            mock.patch.object(helper, "LAST_CAST", os.path.join(root, "state", "last-cast.json")),
+            mock.patch.object(helper, "ASSETS", os.path.join(root, "no-assets")),
+            mock.patch.object(helper, "load_config", return_value={"project_id": "prj_1"}),
+            mock.patch.object(helper, "access_token", return_value=({"project_id": "prj_1"}, "token")),
+            mock.patch.object(helper, "api", api),
+            mock.patch.object(helper, "upload_media", return_value=("med_1", "image/png")),
+            mock.patch.object(helper, "notify"),
+            mock.patch.object(helper, "lan_ip", return_value="192.0.2.10"),
+            mock.patch.object(helper, "lan_subnet", return_value="192.0.2.0/24"),
+            mock.patch.object(helper, "firewall_state", return_value="ok"),
+            mock.patch.object(helper, "mediamtx_binary", return_value="/fake/mediamtx"),
+            mock.patch.object(helper, "wait_for_stream", lambda url, seconds=20: self.probed.append(url) or True),
+            mock.patch.object(helper.time, "sleep"),
+            mock.patch.object(helper.subprocess, "run",
+                              return_value=subprocess.CompletedProcess([], 0, "", "")),
+            mock.patch.object(helper.subprocess, "Popen", popen),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.addCleanup(self.reap)
+
+    def reap(self):
+        for _, proc in self.children:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+
+    def assertStopped(self, *names):
+        started = [cmd[0] for cmd, _ in self.children]
+        self.assertEqual(sorted(started), sorted(names))
+        for cmd, proc in self.children:
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.fail("%s is still running" % cmd[0])
+
+    def start(self, source="screen:DP-1", screens=("scr_A",)):
+        return helper.live_start(source, list(screens), 30, "Desktop")
+
+    def live_file(self, name):
+        return os.path.join(helper.LIVE_DIR, name)
+
+    def cleared(self):
+        """The screens whose takeover was ended."""
+        return [path.split("/")[3] for method, path, _ in self.calls
+                if method == "DELETE" and path.endswith("/takeover")]
+
+    def test_playlist_failure_stops_the_capture(self):
+        self.fail_on["playlist"] = helper.Problem("This project holds agent writes for review.")
+        with self.assertRaises(helper.Problem):
+            self.start(screens=("scr_A", "scr_B"))
+        self.assertStopped("/fake/mediamtx", "gpu-screen-recorder")
+        self.assertFalse(os.path.exists(self.live_file("live.json")))
+        # No takeover was placed, so none is ended: a failed cast leaves the screens' own overrides alone.
+        self.assertEqual(self.cleared(), [])
+        self.assertFalse([c for c in self.calls if c[1].endswith("/takeover")])
+        self.assertFalse([c for c in self.calls if c[0] == "DELETE"])
+
+    def test_capture_that_does_not_start_leaves_the_screens_alone(self):
+        with mock.patch.object(helper, "wait_for_stream", return_value=False), self.assertRaises(helper.Problem):
+            self.start(screens=("scr_A", "scr_B"))
+        self.assertStopped("/fake/mediamtx", "gpu-screen-recorder")
+        self.assertFalse(os.path.exists(self.live_file("live.json")))
+        self.assertEqual(self.cleared(), [])
+
+    def test_failure_while_placing_takeovers_ends_only_those_placed(self):
+        real_api = helper.api
+
+        def flaky(method, path, body=None, **kw):
+            if method == "POST" and path == "/api/screens/scr_B/takeover":
+                raise RuntimeError("unexpected")
+            return real_api(method, path, body, **kw)
+        with mock.patch.object(helper, "api", flaky), self.assertRaises(RuntimeError):
+            self.start(screens=("scr_A", "scr_B", "scr_C"))
+        self.assertStopped("/fake/mediamtx", "gpu-screen-recorder")
+        self.assertFalse(os.path.exists(self.live_file("live.json")))
+        self.assertEqual(self.cleared(), ["scr_A"])
+
+    def test_a_screen_that_refused_is_not_ended_when_the_cast_stops(self):
+        real_api = helper.api
+
+        def refuse_b(method, path, body=None, **kw):
+            if method == "POST" and path == "/api/screens/scr_B/takeover":
+                raise helper.Problem("offline")
+            return real_api(method, path, body, **kw)
+        with mock.patch.object(helper, "api", refuse_b):
+            self.start(screens=("scr_A", "scr_B"))
+        self.assertEqual(helper.live_status()["screens"], ["scr_A"])
+        helper.live_stop()
+        self.assertEqual(self.cleared(), ["scr_A"])
+
+    def test_every_screen_refusing_the_takeover_stops_the_capture(self):
+        real_api = helper.api
+
+        def refuse(method, path, body=None, **kw):
+            if path.endswith("/takeover") and method == "POST":
+                raise helper.Problem("offline")
+            return real_api(method, path, body, **kw)
+        with mock.patch.object(helper, "api", refuse), self.assertRaises(helper.Problem):
+            self.start(screens=("scr_A", "scr_B"))
+        self.assertStopped("/fake/mediamtx", "gpu-screen-recorder")
+        self.assertFalse(os.path.exists(self.live_file("live.json")))
+        self.assertEqual(self.cleared(), [])
+
+    def test_recorder_that_cannot_start_stops_the_server(self):
+        self.fail_on["gpu-screen-recorder"] = FileNotFoundError("gpu-screen-recorder")
+        with self.assertRaises(FileNotFoundError):
+            self.start(screens=("scr_A", "scr_B"))
+        self.assertStopped("/fake/mediamtx")
+        self.assertFalse(os.path.exists(self.live_file("live.json")))
+        self.assertEqual(self.cleared(), [])
+
+    def test_unknown_source_stops_the_server(self):
+        with self.assertRaises(helper.Problem):
+            self.start("nonsense", screens=("scr_A", "scr_B"))
+        self.assertStopped("/fake/mediamtx")
+        self.assertFalse(os.path.exists(self.live_file("live.json")))
+        self.assertEqual(self.cleared(), [])
+
+    def login(self, url):
+        match = re.fullmatch(r"rtsp://([0-9a-f]{16}):([0-9a-f]{32})@192\.0\.2\.10:8554/live", url)
+        self.assertTrue(match, "the screens' address carries a random login")
+        return match.groups()
+
+    def playlist_url(self):
+        post = next(body for method, path, body in self.calls if path.endswith("/playlists"))
+        return post["pages"][0]["primitives"][0]["sources"][0]["url"]
+
+    def test_each_cast_has_its_own_login(self):
+        self.start()
+        first = self.login(self.playlist_url())
+        self.assertEqual(self.probed, ["rtsp://%s:%s@127.0.0.1:8554/live" % first])
+        helper.live_stop()
+        self.calls.clear()
+        self.start()
+        second = self.login(self.playlist_url())
+        self.assertNotEqual(first, second)
+        helper.live_stop()
+
+    def test_reading_needs_the_login_and_only_this_machine_publishes(self):
+        self.start()
+        user, password = self.login(self.playlist_url())
+        with open(self.live_file("mediamtx.yml")) as f:
+            text = f.read()
+        self.assertEqual(stat.S_IMODE(os.stat(self.live_file("mediamtx.yml")).st_mode), 0o600)
+        for secret in (user, password):
+            self.assertNotIn(secret, text)
+
+        def digest(value):
+            return "sha256:" + base64.b64encode(hashlib.sha256(value.encode()).digest()).decode()
+        self.assertIn(digest(user), text)
+        self.assertIn(digest(password), text)
+        # The recorder publishes over loopback without a login.
+        recorder = next(cmd for cmd, _ in self.children if cmd[0] == "gpu-screen-recorder")
+        self.assertEqual(recorder[recorder.index("-o") + 1], "rtsp://127.0.0.1:8554/live")
+        if yaml:
+            users = yaml.safe_load(text)["authInternalUsers"]
+            self.assertEqual(yaml.safe_load(text)["authMethod"], "internal")
+            local, reader = users
+            self.assertEqual((local["user"], local["ips"]), ("any", ["127.0.0.1", "::1"]))
+            self.assertEqual(local["permissions"], [{"action": "publish", "path": "live"}])
+            self.assertEqual((reader["user"], reader["pass"], reader["ips"]),
+                             (digest(user), digest(password), []))
+            self.assertEqual(reader["permissions"], [{"action": "read", "path": "live"}])
+        helper.live_stop()
+
+    def test_login_is_kept_only_in_the_private_state_until_the_cast_ends(self):
+        self.start()
+        _, password = self.login(self.playlist_url())
+        state = self.live_file("live.json")
+        self.assertEqual(stat.S_IMODE(os.stat(state).st_mode), 0o600)
+        self.assertNotIn("url", helper.live_status())
+        self.assertNotIn(password, json.dumps(helper.live_status()))
+
+        def holders():
+            found = []
+            for top, _, names in os.walk(self.tmp.name):
+                for name in names:
+                    with open(os.path.join(top, name), "rb") as f:
+                        if password.encode() in f.read():
+                            found.append(name)
+            return found
+        self.assertEqual(holders(), ["live.json"])
+        helper.live_stop()
+        self.assertEqual(holders(), [])
+        self.assertIn(("DELETE", "/api/playlists/pl_cast", None), self.calls)
+
+
+class Answer:
+    """A urlopen() result whose body can fail the way a dropped connection does."""
+
+    def __init__(self, body=b"{}", fail=None):
+        self.headers = {}
+        self.body, self.fail = body, fail
+
+    def read(self):
+        if self.fail:
+            raise self.fail
+        return self.body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class Stop(Exception):
+    """Ends a loop that would otherwise run forever."""
+
+
+class BadAnswers(unittest.TestCase):
+    CFG = {"api_url": "https://api.example.invalid", "project_id": "prj_1"}
+    FAILURES = {
+        "truncated body": lambda: Answer(fail=http.client.IncompleteRead(b'{"items"', 40)),
+        "not JSON": lambda: Answer(b"<html>502 Bad Gateway</html>"),
+        "connection reset": lambda: Answer(fail=ConnectionResetError("reset")),
+        "read timeout": lambda: Answer(fail=TimeoutError("timed out")),
+    }
+
+    def setUp(self):
+        for patch in (mock.patch.object(helper, "access_token", return_value=(self.CFG, "token")),
+                      mock.patch.object(helper, "warn")):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def urlopen(self, name):
+        return mock.patch.object(helper.urllib.request, "urlopen", side_effect=lambda *a, **k: self.FAILURES[name]())
+
+    def test_api_turns_each_into_a_problem(self):
+        for name in self.FAILURES:
+            with self.subTest(name), self.urlopen(name), self.assertRaises(helper.Problem):
+                helper.api("GET", "/api/screens")
+
+    def cut_error(self):
+        """A 502 whose body the connection drops while it is read."""
+        class Cut(io.BytesIO):
+            def read(self, *args):
+                raise http.client.IncompleteRead(b"", 10)
+        err = urllib.error.HTTPError("https://api.example.invalid/x", 502, "Bad Gateway", {}, Cut())
+        self.addCleanup(err.close)
+        return err
+
+    def test_error_answer_with_a_truncated_body_is_still_its_status(self):
+        with mock.patch.object(helper.urllib.request, "urlopen", side_effect=self.cut_error()):
+            with self.assertRaisesRegex(helper.Problem, "HTTP 502"):
+                helper.api("GET", "/api/screens")
+
+    def test_event_stream_refused_with_a_truncated_body_reconnects(self):
+        sent = []
+        with mock.patch.object(helper.urllib.request, "urlopen", side_effect=self.cut_error()), \
+             mock.patch.object(helper, "emit", sent.append), \
+             mock.patch.object(helper.time, "sleep", side_effect=Stop):
+            with self.assertRaises(Stop):
+                helper.Follower(do_notify=False).stream()
+        self.assertEqual([(s["ok"], s["error"]) for s in sent], [(False, "HTTP 502")])
+
+    def test_refresh_reports_and_returns(self):
+        for name in self.FAILURES:
+            sent = []
+            with self.subTest(name), self.urlopen(name), mock.patch.object(helper, "emit", sent.append):
+                helper.Follower(do_notify=False).refresh()
+            self.assertEqual([(s["kind"], s["ok"]) for s in sent], [("status", False)])
+
+    def test_snapshot_loop_survives_them(self):
+        for name in self.FAILURES:
+            follower = helper.Follower(do_notify=False)
+            follower.dirty = mock.Mock(wait=mock.Mock(side_effect=[False, Stop]))
+            with self.subTest(name), self.urlopen(name), mock.patch.object(helper, "emit"):
+                with self.assertRaises(Stop):
+                    follower.snapshot_loop()
+            self.assertEqual(follower.dirty.wait.call_count, 2)
+
+    def test_reviews_loop_survives_them(self):
+        for name in self.FAILURES:
+            with self.subTest(name), self.urlopen(name), mock.patch.object(helper.time, "sleep", side_effect=Stop):
+                with self.assertRaises(Stop):
+                    helper.Follower(do_notify=False).reviews_loop()
+
+    def test_event_stream_cut_mid_chunk_reconnects(self):
+        class Cut:
+            def __iter__(self):
+                raise http.client.IncompleteRead(b"", 5)
+        sent = []
+        with mock.patch.object(helper.urllib.request, "urlopen", return_value=Cut()), \
+             mock.patch.object(helper, "emit", sent.append), \
+             mock.patch.object(helper.time, "sleep", side_effect=Stop):
+            with self.assertRaises(Stop):
+                helper.Follower(do_notify=False).stream()
+        self.assertEqual([s["ok"] for s in sent], [True, False])
 
 
 class PluginLookup(unittest.TestCase):
