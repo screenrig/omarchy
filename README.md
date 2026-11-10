@@ -93,7 +93,9 @@ Cast tab:
   plugin downloads [mediamtx](https://github.com/bluenviron/mediamtx) v1.21.3,
   checks it against the release's published SHA-256 and keeps it in
   `~/.local/share/screenrig-omarchy/bin`; it serves RTSP over TCP on port 8554.
-  Screens reach it on the same network: Android and Linux Players.
+  Each cast has its own random login, which the screens receive in the stream
+  address; only this laptop can publish to it. Screens reach it on the same
+  network: Android and Linux Players.
 - Agent: Claude Code, Codex or Grok with the screenRIG plugin. The panel
   detects installed integrations and prefers your Omarchy default agent
   (`omarchy default agent`).

@@ -1,3 +1,5 @@
+import base64
+import hashlib
 import http.client
 import importlib.machinery
 import importlib.util
@@ -5,12 +7,18 @@ import io
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
 import unittest
 import urllib.error
 from unittest import mock
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 loader = importlib.machinery.SourceFileLoader("helper", os.path.join(HERE, "..", "bin", "screenrig-omarchy"))
@@ -341,6 +349,74 @@ class LiveCastStart(unittest.TestCase):
             self.start("nonsense")
         self.assertStopped("/fake/mediamtx")
         self.assertFalse(os.path.exists(self.live_file("live.json")))
+
+    def login(self, url):
+        match = re.fullmatch(r"rtsp://([0-9a-f]{16}):([0-9a-f]{32})@192\.0\.2\.10:8554/live", url)
+        self.assertTrue(match, "the screens' address carries a random login")
+        return match.groups()
+
+    def playlist_url(self):
+        post = next(body for method, path, body in self.calls if path.endswith("/playlists"))
+        return post["pages"][0]["primitives"][0]["sources"][0]["url"]
+
+    def test_each_cast_has_its_own_login(self):
+        self.start()
+        first = self.login(self.playlist_url())
+        self.assertEqual(self.probed, ["rtsp://%s:%s@127.0.0.1:8554/live" % first])
+        helper.live_stop()
+        self.calls.clear()
+        self.start()
+        second = self.login(self.playlist_url())
+        self.assertNotEqual(first, second)
+        helper.live_stop()
+
+    def test_reading_needs_the_login_and_only_this_machine_publishes(self):
+        self.start()
+        user, password = self.login(self.playlist_url())
+        with open(self.live_file("mediamtx.yml")) as f:
+            text = f.read()
+        self.assertEqual(stat.S_IMODE(os.stat(self.live_file("mediamtx.yml")).st_mode), 0o600)
+        for secret in (user, password):
+            self.assertNotIn(secret, text)
+
+        def digest(value):
+            return "sha256:" + base64.b64encode(hashlib.sha256(value.encode()).digest()).decode()
+        self.assertIn(digest(user), text)
+        self.assertIn(digest(password), text)
+        # The recorder publishes over loopback without a login.
+        recorder = next(cmd for cmd, _ in self.children if cmd[0] == "gpu-screen-recorder")
+        self.assertEqual(recorder[recorder.index("-o") + 1], "rtsp://127.0.0.1:8554/live")
+        if yaml:
+            users = yaml.safe_load(text)["authInternalUsers"]
+            self.assertEqual(yaml.safe_load(text)["authMethod"], "internal")
+            local, reader = users
+            self.assertEqual((local["user"], local["ips"]), ("any", ["127.0.0.1", "::1"]))
+            self.assertEqual(local["permissions"], [{"action": "publish", "path": "live"}])
+            self.assertEqual((reader["user"], reader["pass"], reader["ips"]),
+                             (digest(user), digest(password), []))
+            self.assertEqual(reader["permissions"], [{"action": "read", "path": "live"}])
+        helper.live_stop()
+
+    def test_login_is_kept_only_in_the_private_state_until_the_cast_ends(self):
+        self.start()
+        _, password = self.login(self.playlist_url())
+        state = self.live_file("live.json")
+        self.assertEqual(stat.S_IMODE(os.stat(state).st_mode), 0o600)
+        self.assertNotIn("url", helper.live_status())
+        self.assertNotIn(password, json.dumps(helper.live_status()))
+
+        def holders():
+            found = []
+            for top, _, names in os.walk(self.tmp.name):
+                for name in names:
+                    with open(os.path.join(top, name), "rb") as f:
+                        if password.encode() in f.read():
+                            found.append(name)
+            return found
+        self.assertEqual(holders(), ["live.json"])
+        helper.live_stop()
+        self.assertEqual(holders(), [])
+        self.assertIn(("DELETE", "/api/playlists/pl_cast", None), self.calls)
 
 
 class Answer:

@@ -1194,18 +1194,43 @@ def mediamtx_binary():
     return path
 
 
-def mediamtx_config():
+def write_private(path, text):
+    """Replace path with a file only this user can read."""
+    fd = os.open(path + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    os.replace(path + ".tmp", path)
+
+
+def mediamtx_secret(value):
+    """mediamtx's `sha256:` form of a user name or password: base64 of its SHA-256, as a quoted scalar."""
+    return json.dumps("sha256:" + base64.b64encode(hashlib.sha256(value.encode()).digest()).decode())
+
+
+def mediamtx_config(user, password):
+    """Reading `live` takes this cast's login; only this machine may publish. The login is stored
+    hashed, so the file holds nothing to read back."""
     os.makedirs(LIVE_DIR, mode=0o700, exist_ok=True)
     path = os.path.join(LIVE_DIR, "mediamtx.yml")
-    with open(path, "w") as f:
-        f.write(
-            "logLevel: info\n"
-            "api: no\nmetrics: no\npprof: no\nplayback: no\n"
-            "rtsp: yes\nrtspAddress: :%d\nrtspTransports: [tcp]\nrtspEncryption: \"no\"\n"
-            "rtmp: no\n"
-            "hls: no\nwebrtc: no\nsrt: no\n"
-            "paths:\n  live:\n" % LIVE_PORT)
+    write_private(path, (
+        "logLevel: info\n"
+        "api: no\nmetrics: no\npprof: no\nplayback: no\n"
+        "rtsp: yes\nrtspAddress: :%d\nrtspTransports: [tcp]\nrtspEncryption: \"no\"\n"
+        "rtmp: no\n"
+        "hls: no\nwebrtc: no\nsrt: no\n"
+        "authMethod: internal\n"
+        "authInternalUsers:\n"
+        "  - user: any\n    pass:\n    ips: [\"127.0.0.1\", \"::1\"]\n"
+        "    permissions:\n      - action: publish\n        path: live\n"
+        "  - user: %s\n    pass: %s\n    ips: []\n"
+        "    permissions:\n      - action: read\n        path: live\n"
+        "paths:\n  live:\n" % (LIVE_PORT, mediamtx_secret(user), mediamtx_secret(password))))
     return path
+
+
+def live_url(host, user, password):
+    return "rtsp://%s:%s@%s:%d/live" % (user, password, host, LIVE_PORT)
 
 
 def firewall_state(subnet):
@@ -1298,14 +1323,12 @@ def live_project_state():
 
 
 def live_playlist(url):
-    """The project's live stream playlist for this URL, made once."""
+    """A playlist that plays this cast's stream. Its address carries the cast's login, so every cast
+    makes its own (live_stop deletes it) and the address is never kept in the project state."""
     cfg, _ = access_token()
     pid = project_id(cfg)
     path, state = live_project_state()
-    current = state.get("fallback_version") == FALLBACK_VERSION
-    if state.get("url") == url and state.get("playlist_id") and current:
-        return state["playlist_id"]
-    fallback = state.get("fallback_media_id") if current else None
+    fallback = state.get("fallback_media_id") if state.get("fallback_version") == FALLBACK_VERSION else None
     if not fallback:
         png = os.path.join(ASSETS, "live-fallback.png")
         if not os.path.exists(png):
@@ -1313,6 +1336,8 @@ def live_playlist(url):
             with open(png, "wb") as f:
                 f.write(solid_png())
         fallback, _ = upload_media(png)
+        with open(path, "w") as f:
+            json.dump({"fallback_media_id": fallback, "fallback_version": FALLBACK_VERSION}, f)
     page = {
         "id": "live",
         "canvas": {"width": 1920, "height": 1080, "background": "#000000FF"},
@@ -1326,9 +1351,6 @@ def live_playlist(url):
                    {"name": "Live cast from %s" % socket.gethostname(), "pages": [page]}, idempotent=True)
     if "id" not in playlist:
         raise Problem("The live playlist waits for a person's review before it can play.")
-    with open(path, "w") as f:
-        json.dump({"url": url, "playlist_id": playlist["id"], "fallback_media_id": fallback,
-                   "fallback_version": FALLBACK_VERSION}, f)
     return playlist["id"]
 
 
@@ -1356,7 +1378,8 @@ def live_status():
     except (OSError, ValueError):
         return {"ok": True, "live": False}
     alive = all(pid_alive(state.get(k)) for k in ("recorder_pid", "server_pid"))
-    return dict(state, ok=True, live=alive)
+    # The stream address carries the cast's login; nothing that reads the status needs it.
+    return dict({k: v for k, v in state.items() if k != "url"}, ok=True, live=alive)
 
 
 def pid_alive(pid):
@@ -1394,10 +1417,12 @@ def live_start(source, screens, minutes, label):
     os.makedirs(LIVE_DIR, mode=0o700, exist_ok=True)
     logs = os.path.join(CACHE, "live")
     os.makedirs(logs, exist_ok=True)
-    server = subprocess.Popen([mediamtx_binary(), mediamtx_config()], stdout=open(os.path.join(logs, "mediamtx.log"), "w"),
+    user, password = secrets.token_hex(8), secrets.token_hex(16)
+    server = subprocess.Popen([mediamtx_binary(), mediamtx_config(user, password)],
+                              stdout=open(os.path.join(logs, "mediamtx.log"), "w"),
                               stderr=subprocess.STDOUT, start_new_session=True)
     state = {"server_pid": server.pid, "source": source, "label": label, "screens": screens,
-             "started_at": time.time(), "url": "rtsp://%s:%d/live" % (ip, LIVE_PORT)}
+             "started_at": time.time(), "url": live_url(ip, user, password)}
     started = False
     try:
         time.sleep(0.6)
@@ -1416,11 +1441,11 @@ def live_start(source, screens, minutes, label):
             # Media3 rejects the empty `s= ` mediamtx writes for RTMP sources.
             "-c", "rtsp", "-ffmpeg-opts", "rtsp_transport=tcp", "-o", "rtsp://127.0.0.1:%d/live" % LIVE_PORT],
             stdout=open(os.path.join(logs, "recorder.log"), "w"), stderr=subprocess.STDOUT, start_new_session=True).pid
-        with open(os.path.join(LIVE_DIR, "live.json"), "w") as f:
-            json.dump(state, f)
-        if not wait_for_stream("rtsp://127.0.0.1:%d/live" % LIVE_PORT):
+        write_private(os.path.join(LIVE_DIR, "live.json"), json.dumps(state))
+        # The recorder publishes over loopback, which needs no login; reading does.
+        if not wait_for_stream(live_url("127.0.0.1", user, password)):
             raise Problem("The capture did not start; see %s" % os.path.join(logs, "recorder.log"))
-        playlist = live_playlist(state["url"])
+        playlist = state["playlist_id"] = live_playlist(state["url"])
         until = iso_in(minutes) if minutes > 0 else iso_in(LIVE_LEASE_MIN)
         shown, failed = [], []
         for sid in screens:
@@ -1433,16 +1458,14 @@ def live_start(source, screens, minutes, label):
         if not shown:
             raise Problem("No screen took the cast: %s" % "; ".join(failed))
         # `until` is the cast's own end (none until stopped); the lease is the takeover's.
-        state.update(playlist_id=playlist, screens=shown, until=until if minutes > 0 else None,
-                     lease=minutes <= 0, renewed_at=time.time())
+        state.update(screens=shown, until=until if minutes > 0 else None, lease=minutes <= 0, renewed_at=time.time())
         keepalive = [sys.executable, os.path.realpath(__file__), "live-keepalive"]
         if shutil.which("systemd-inhibit"):
             keepalive = ["systemd-inhibit", "--what=sleep:shutdown", "--mode=delay", "--who=screenRIG",
                          "--why=Stop the live cast before sleeping"] + keepalive
         state["keepalive_pid"] = subprocess.Popen(keepalive, stdout=open(os.path.join(logs, "keepalive.log"), "w"),
                                                   stderr=subprocess.STDOUT, start_new_session=True).pid
-        with open(os.path.join(LIVE_DIR, "live.json"), "w") as f:
-            json.dump(state, f)
+        write_private(os.path.join(LIVE_DIR, "live.json"), json.dumps(state))
         remember_cast(source=source, label=label, screens=shown, minutes=str(minutes))
         # Stays up until the cast ends, so Stop is always one click away.
         ends = time.strftime(" · until %-I:%M %p", time.localtime(time.time() + minutes * 60)) if minutes > 0 else ""
@@ -1454,8 +1477,7 @@ def live_start(source, screens, minutes, label):
     finally:
         if not started:
             # Whatever failed after the capture began, end it the way Stop does.
-            with open(os.path.join(LIVE_DIR, "live.json"), "w") as f:
-                json.dump(state, f)
+            write_private(os.path.join(LIVE_DIR, "live.json"), json.dumps(state))
             live_stop()
 
 
@@ -1510,9 +1532,7 @@ def keep_alive_loop(path, stop_now):
                 except Problem as err:
                     warn("lease renewal for %s failed: %s" % (sid, err))
             state["renewed_at"] = time.time()
-            with open(path + ".tmp", "w") as f:
-                json.dump(state, f)
-            os.replace(path + ".tmp", path)
+            write_private(path, json.dumps(state))
 
 
 def live_stop():
@@ -1537,6 +1557,12 @@ def live_stop():
                 pass
     os.remove(path)
     subprocess.run(["omarchy-shell", "notifications", "dismiss", LIVE_NOTICE], capture_output=True)
+    if state.get("playlist_id"):
+        # The playlist's stream address carries the cast's login; the takeovers are gone, so it can go too.
+        try:
+            api("DELETE", "/api/playlists/%s" % state["playlist_id"], idempotent=True)
+        except Problem:
+            pass
     return "Live cast stopped"
 
 
