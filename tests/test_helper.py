@@ -5,6 +5,8 @@ import io
 import json
 import os
 import re
+import subprocess
+import sys
 import tempfile
 import unittest
 import urllib.error
@@ -227,6 +229,118 @@ class LiveCast(unittest.TestCase):
     def test_fallback_png_is_a_png(self):
         png = helper.solid_png(4, 2)
         self.assertTrue(png.startswith(b"\x89PNG\r\n\x1a\n") and png.endswith(b"IEND\xaeB`\x82"))
+
+
+class LiveCastStart(unittest.TestCase):
+    """live_start with the recorder, mediamtx and the keep-alive replaced by idle processes."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = self.tmp.name
+        self.children, self.calls, self.probed = [], [], []
+        self.fail_on = {}
+        real_popen = subprocess.Popen
+
+        def popen(cmd, **kw):
+            if hasattr(kw.get("stdout"), "close"):
+                kw["stdout"].close()
+            if cmd[0] in self.fail_on:
+                raise self.fail_on[cmd[0]]
+            # Restores SIGINT in case the test run started with it ignored.
+            idle = "import signal, time; signal.signal(signal.SIGINT, signal.SIG_DFL); time.sleep(60)"
+            proc = real_popen([sys.executable, "-I", "-c", idle], stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, start_new_session=kw.get("start_new_session", False))
+            self.children.append((cmd, proc))
+            return proc
+
+        def api(method, path, body=None, **kw):
+            self.calls.append((method, path, body))
+            if method == "POST" and path.endswith("/playlists"):
+                if "playlist" in self.fail_on:
+                    raise self.fail_on["playlist"]
+                return {"id": "pl_cast"}
+            return {}
+
+        patches = [
+            mock.patch.object(helper, "STATE", os.path.join(root, "state")),
+            mock.patch.object(helper, "CACHE", os.path.join(root, "cache")),
+            mock.patch.object(helper, "LIVE_DIR", os.path.join(root, "state", "live")),
+            mock.patch.object(helper, "LAST_CAST", os.path.join(root, "state", "last-cast.json")),
+            mock.patch.object(helper, "ASSETS", os.path.join(root, "no-assets")),
+            mock.patch.object(helper, "load_config", return_value={"project_id": "prj_1"}),
+            mock.patch.object(helper, "access_token", return_value=({"project_id": "prj_1"}, "token")),
+            mock.patch.object(helper, "api", api),
+            mock.patch.object(helper, "upload_media", return_value=("med_1", "image/png")),
+            mock.patch.object(helper, "notify"),
+            mock.patch.object(helper, "lan_ip", return_value="192.0.2.10"),
+            mock.patch.object(helper, "lan_subnet", return_value="192.0.2.0/24"),
+            mock.patch.object(helper, "firewall_state", return_value="ok"),
+            mock.patch.object(helper, "mediamtx_binary", return_value="/fake/mediamtx"),
+            mock.patch.object(helper, "wait_for_stream", lambda url, seconds=20: self.probed.append(url) or True),
+            mock.patch.object(helper.time, "sleep"),
+            mock.patch.object(helper.subprocess, "run",
+                              return_value=subprocess.CompletedProcess([], 0, "", "")),
+            mock.patch.object(helper.subprocess, "Popen", popen),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.addCleanup(self.reap)
+
+    def reap(self):
+        for _, proc in self.children:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+
+    def assertStopped(self, *names):
+        started = [cmd[0] for cmd, _ in self.children]
+        self.assertEqual(sorted(started), sorted(names))
+        for cmd, proc in self.children:
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.fail("%s is still running" % cmd[0])
+
+    def start(self, source="screen:DP-1"):
+        return helper.live_start(source, ["scr_A"], 30, "Desktop")
+
+    def live_file(self, name):
+        return os.path.join(helper.LIVE_DIR, name)
+
+    def test_playlist_failure_stops_the_capture(self):
+        self.fail_on["playlist"] = helper.Problem("This project holds agent writes for review.")
+        with self.assertRaises(helper.Problem):
+            self.start()
+        self.assertStopped("/fake/mediamtx", "gpu-screen-recorder")
+        self.assertFalse(os.path.exists(self.live_file("live.json")))
+        self.assertIn(("DELETE", "/api/screens/scr_A/takeover", None), self.calls)
+
+    def test_every_screen_refusing_the_takeover_stops_the_capture(self):
+        real_api = helper.api
+
+        def refuse(method, path, body=None, **kw):
+            if path.endswith("/takeover") and method == "POST":
+                raise helper.Problem("offline")
+            return real_api(method, path, body, **kw)
+        with mock.patch.object(helper, "api", refuse), self.assertRaises(helper.Problem):
+            self.start()
+        self.assertStopped("/fake/mediamtx", "gpu-screen-recorder")
+        self.assertFalse(os.path.exists(self.live_file("live.json")))
+
+    def test_recorder_that_cannot_start_stops_the_server(self):
+        self.fail_on["gpu-screen-recorder"] = FileNotFoundError("gpu-screen-recorder")
+        with self.assertRaises(FileNotFoundError):
+            self.start()
+        self.assertStopped("/fake/mediamtx")
+        self.assertFalse(os.path.exists(self.live_file("live.json")))
+
+    def test_unknown_source_stops_the_server(self):
+        with self.assertRaises(helper.Problem):
+            self.start("nonsense")
+        self.assertStopped("/fake/mediamtx")
+        self.assertFalse(os.path.exists(self.live_file("live.json")))
 
 
 class Answer:

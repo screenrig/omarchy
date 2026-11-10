@@ -1396,60 +1396,67 @@ def live_start(source, screens, minutes, label):
     os.makedirs(logs, exist_ok=True)
     server = subprocess.Popen([mediamtx_binary(), mediamtx_config()], stdout=open(os.path.join(logs, "mediamtx.log"), "w"),
                               stderr=subprocess.STDOUT, start_new_session=True)
-    time.sleep(0.6)
-    if source.startswith("window:"):
-        os.makedirs(CACHE, exist_ok=True)
-        with open(os.path.join(CACHE, "live-pick"), "w") as f:
-            f.write(source)
-        capture = ["-w", "portal", "-restore-portal-session", "no"]
-    elif source.startswith("screen:"):
-        capture = ["-w", source.split(":", 1)[1]]
-    else:
-        raise Problem("Unknown live source %s" % source)
-    recorder = subprocess.Popen(["gpu-screen-recorder"] + capture + [
-        "-f", "30", "-s", "1920x1080", "-k", "h264", "-bm", "cbr", "-q", "6000", "-keyint", "1", "-cursor", "yes",
-        # Published over RTSP so the description carries a session name; Android's
-        # Media3 rejects the empty `s= ` mediamtx writes for RTMP sources.
-        "-c", "rtsp", "-ffmpeg-opts", "rtsp_transport=tcp", "-o", "rtsp://127.0.0.1:%d/live" % LIVE_PORT],
-        stdout=open(os.path.join(logs, "recorder.log"), "w"), stderr=subprocess.STDOUT, start_new_session=True)
-    state = {"server_pid": server.pid, "recorder_pid": recorder.pid, "source": source, "label": label,
-             "screens": screens, "started_at": time.time(), "url": "rtsp://%s:%d/live" % (ip, LIVE_PORT)}
-    with open(os.path.join(LIVE_DIR, "live.json"), "w") as f:
-        json.dump(state, f)
-    if not wait_for_stream("rtsp://127.0.0.1:%d/live" % LIVE_PORT):
-        live_stop()
-        raise Problem("The capture did not start; see %s" % os.path.join(logs, "recorder.log"))
-    playlist = live_playlist(state["url"])
-    until = iso_in(minutes) if minutes > 0 else iso_in(LIVE_LEASE_MIN)
-    shown, failed = [], []
-    for sid in screens:
-        try:
-            api("POST", "/api/screens/%s/takeover" % sid,
-                {"playlist_id": playlist, "until": until, "reason": "Live cast from Omarchy"}, idempotent=True)
-            shown.append(sid)
-        except Problem as err:
-            failed.append(str(err))
-    if not shown:
-        live_stop()
-        raise Problem("No screen took the cast: %s" % "; ".join(failed))
-    # `until` is the cast's own end (none until stopped); the lease is the takeover's.
-    state.update(playlist_id=playlist, screens=shown, until=until if minutes > 0 else None,
-                 lease=minutes <= 0, renewed_at=time.time())
-    keepalive = [sys.executable, os.path.realpath(__file__), "live-keepalive"]
-    if shutil.which("systemd-inhibit"):
-        keepalive = ["systemd-inhibit", "--what=sleep:shutdown", "--mode=delay", "--who=screenRIG",
-                     "--why=Stop the live cast before sleeping"] + keepalive
-    state["keepalive_pid"] = subprocess.Popen(keepalive, stdout=open(os.path.join(logs, "keepalive.log"), "w"),
-                                              stderr=subprocess.STDOUT, start_new_session=True).pid
-    with open(os.path.join(LIVE_DIR, "live.json"), "w") as f:
-        json.dump(state, f)
-    remember_cast(source=source, label=label, screens=shown, minutes=str(minutes))
-    # Stays up until the cast ends, so Stop is always one click away.
-    ends = time.strftime(" · until %-I:%M %p", time.localtime(time.time() + minutes * 60)) if minutes > 0 else ""
-    notify(LIVE_NOTICE, "%s on %d screen%s%s" % (label, len(shown), "" if len(shown) == 1 else "s", ends), "critical",
-           [("Stop", ["screenrig-omarchy", "live-stop", "--notify"]),
-            ("Open", ["omarchy-shell", "shell", "summon", PLUGIN_ID, json.dumps({"mode": "cast"})])], "󰑋")
-    return "Live: %s on %d screen%s" % (label, len(shown), "" if len(shown) == 1 else "s")
+    state = {"server_pid": server.pid, "source": source, "label": label, "screens": screens,
+             "started_at": time.time(), "url": "rtsp://%s:%d/live" % (ip, LIVE_PORT)}
+    started = False
+    try:
+        time.sleep(0.6)
+        if source.startswith("window:"):
+            os.makedirs(CACHE, exist_ok=True)
+            with open(os.path.join(CACHE, "live-pick"), "w") as f:
+                f.write(source)
+            capture = ["-w", "portal", "-restore-portal-session", "no"]
+        elif source.startswith("screen:"):
+            capture = ["-w", source.split(":", 1)[1]]
+        else:
+            raise Problem("Unknown live source %s" % source)
+        state["recorder_pid"] = subprocess.Popen(["gpu-screen-recorder"] + capture + [
+            "-f", "30", "-s", "1920x1080", "-k", "h264", "-bm", "cbr", "-q", "6000", "-keyint", "1", "-cursor", "yes",
+            # Published over RTSP so the description carries a session name; Android's
+            # Media3 rejects the empty `s= ` mediamtx writes for RTMP sources.
+            "-c", "rtsp", "-ffmpeg-opts", "rtsp_transport=tcp", "-o", "rtsp://127.0.0.1:%d/live" % LIVE_PORT],
+            stdout=open(os.path.join(logs, "recorder.log"), "w"), stderr=subprocess.STDOUT, start_new_session=True).pid
+        with open(os.path.join(LIVE_DIR, "live.json"), "w") as f:
+            json.dump(state, f)
+        if not wait_for_stream("rtsp://127.0.0.1:%d/live" % LIVE_PORT):
+            raise Problem("The capture did not start; see %s" % os.path.join(logs, "recorder.log"))
+        playlist = live_playlist(state["url"])
+        until = iso_in(minutes) if minutes > 0 else iso_in(LIVE_LEASE_MIN)
+        shown, failed = [], []
+        for sid in screens:
+            try:
+                api("POST", "/api/screens/%s/takeover" % sid,
+                    {"playlist_id": playlist, "until": until, "reason": "Live cast from Omarchy"}, idempotent=True)
+                shown.append(sid)
+            except Problem as err:
+                failed.append(str(err))
+        if not shown:
+            raise Problem("No screen took the cast: %s" % "; ".join(failed))
+        # `until` is the cast's own end (none until stopped); the lease is the takeover's.
+        state.update(playlist_id=playlist, screens=shown, until=until if minutes > 0 else None,
+                     lease=minutes <= 0, renewed_at=time.time())
+        keepalive = [sys.executable, os.path.realpath(__file__), "live-keepalive"]
+        if shutil.which("systemd-inhibit"):
+            keepalive = ["systemd-inhibit", "--what=sleep:shutdown", "--mode=delay", "--who=screenRIG",
+                         "--why=Stop the live cast before sleeping"] + keepalive
+        state["keepalive_pid"] = subprocess.Popen(keepalive, stdout=open(os.path.join(logs, "keepalive.log"), "w"),
+                                                  stderr=subprocess.STDOUT, start_new_session=True).pid
+        with open(os.path.join(LIVE_DIR, "live.json"), "w") as f:
+            json.dump(state, f)
+        remember_cast(source=source, label=label, screens=shown, minutes=str(minutes))
+        # Stays up until the cast ends, so Stop is always one click away.
+        ends = time.strftime(" · until %-I:%M %p", time.localtime(time.time() + minutes * 60)) if minutes > 0 else ""
+        notify(LIVE_NOTICE, "%s on %d screen%s%s" % (label, len(shown), "" if len(shown) == 1 else "s", ends), "critical",
+               [("Stop", ["screenrig-omarchy", "live-stop", "--notify"]),
+                ("Open", ["omarchy-shell", "shell", "summon", PLUGIN_ID, json.dumps({"mode": "cast"})])], "󰑋")
+        started = True
+        return "Live: %s on %d screen%s" % (label, len(shown), "" if len(shown) == 1 else "s")
+    finally:
+        if not started:
+            # Whatever failed after the capture began, end it the way Stop does.
+            with open(os.path.join(LIVE_DIR, "live.json"), "w") as f:
+                json.dump(state, f)
+            live_stop()
 
 
 def live_keepalive():
