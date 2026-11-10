@@ -8,6 +8,7 @@ prints one line per snapshot or event until it is stopped.
 import base64
 import glob
 import hashlib
+import http.client
 import json
 import mimetypes
 import os
@@ -282,6 +283,14 @@ def _note_credits(headers):
             pass
 
 
+def error_body(err):
+    """An HTTP error answer's body; empty when the connection dropped while it was read."""
+    try:
+        return err.read().decode(errors="replace")
+    except (http.client.HTTPException, OSError):
+        return ""
+
+
 def problem_message(status, body):
     try:
         p = json.loads(body)
@@ -310,13 +319,16 @@ def api(method, path, body=None, idempotent=False, raw=False, headers=None, _ret
                 return payload, resp.headers
             return json.loads(payload) if payload else {}
     except urllib.error.HTTPError as err:
-        payload = err.read().decode(errors="replace")
+        payload = error_body(err)
         if err.code == 401 and not _retried and "invalid_token" in (err.headers.get("WWW-Authenticate") or ""):
             access_token(force=True)
             return api(method, path, body, idempotent, raw, headers, _retried=True)
         raise Problem(problem_message(err.code, payload))
     except urllib.error.URLError as err:
         raise Problem("Cannot reach screenRIG: %s" % err.reason)
+    except (http.client.HTTPException, OSError, ValueError) as err:
+        # A body cut short, a reset or timeout while reading it, or a 200 that is not JSON.
+        raise Problem("screenRIG sent an incomplete or unreadable answer: %s" % (str(err) or type(err).__name__)) from err
 
 
 def paged(path):
@@ -1914,8 +1926,8 @@ class Follower:
                     except Problem as perr:
                         emit({"kind": "status", "ok": False, "error": str(perr)})
                 else:
-                    emit({"kind": "status", "ok": False, "error": problem_message(err.code, err.read().decode(errors="replace"))})
-            except (Problem, OSError, urllib.error.URLError) as err:
+                    emit({"kind": "status", "ok": False, "error": problem_message(err.code, error_body(err))})
+            except (Problem, OSError, urllib.error.URLError, http.client.HTTPException) as err:
                 emit({"kind": "status", "ok": False, "error": str(err)})
             time.sleep(backoff)
             backoff = min(backoff * 2, 60)

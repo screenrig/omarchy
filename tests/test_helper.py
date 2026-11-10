@@ -1,10 +1,13 @@
+import http.client
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import re
 import tempfile
 import unittest
+import urllib.error
 from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -224,6 +227,110 @@ class LiveCast(unittest.TestCase):
     def test_fallback_png_is_a_png(self):
         png = helper.solid_png(4, 2)
         self.assertTrue(png.startswith(b"\x89PNG\r\n\x1a\n") and png.endswith(b"IEND\xaeB`\x82"))
+
+
+class Answer:
+    """A urlopen() result whose body can fail the way a dropped connection does."""
+
+    def __init__(self, body=b"{}", fail=None):
+        self.headers = {}
+        self.body, self.fail = body, fail
+
+    def read(self):
+        if self.fail:
+            raise self.fail
+        return self.body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class Stop(Exception):
+    """Ends a loop that would otherwise run forever."""
+
+
+class BadAnswers(unittest.TestCase):
+    CFG = {"api_url": "https://api.example.invalid", "project_id": "prj_1"}
+    FAILURES = {
+        "truncated body": lambda: Answer(fail=http.client.IncompleteRead(b'{"items"', 40)),
+        "not JSON": lambda: Answer(b"<html>502 Bad Gateway</html>"),
+        "connection reset": lambda: Answer(fail=ConnectionResetError("reset")),
+        "read timeout": lambda: Answer(fail=TimeoutError("timed out")),
+    }
+
+    def setUp(self):
+        for patch in (mock.patch.object(helper, "access_token", return_value=(self.CFG, "token")),
+                      mock.patch.object(helper, "warn")):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def urlopen(self, name):
+        return mock.patch.object(helper.urllib.request, "urlopen", side_effect=lambda *a, **k: self.FAILURES[name]())
+
+    def test_api_turns_each_into_a_problem(self):
+        for name in self.FAILURES:
+            with self.subTest(name), self.urlopen(name), self.assertRaises(helper.Problem):
+                helper.api("GET", "/api/screens")
+
+    def cut_error(self):
+        """A 502 whose body the connection drops while it is read."""
+        class Cut(io.BytesIO):
+            def read(self, *args):
+                raise http.client.IncompleteRead(b"", 10)
+        err = urllib.error.HTTPError("https://api.example.invalid/x", 502, "Bad Gateway", {}, Cut())
+        self.addCleanup(err.close)
+        return err
+
+    def test_error_answer_with_a_truncated_body_is_still_its_status(self):
+        with mock.patch.object(helper.urllib.request, "urlopen", side_effect=self.cut_error()):
+            with self.assertRaisesRegex(helper.Problem, "HTTP 502"):
+                helper.api("GET", "/api/screens")
+
+    def test_event_stream_refused_with_a_truncated_body_reconnects(self):
+        sent = []
+        with mock.patch.object(helper.urllib.request, "urlopen", side_effect=self.cut_error()), \
+             mock.patch.object(helper, "emit", sent.append), \
+             mock.patch.object(helper.time, "sleep", side_effect=Stop):
+            with self.assertRaises(Stop):
+                helper.Follower(do_notify=False).stream()
+        self.assertEqual([(s["ok"], s["error"]) for s in sent], [(False, "HTTP 502")])
+
+    def test_refresh_reports_and_returns(self):
+        for name in self.FAILURES:
+            sent = []
+            with self.subTest(name), self.urlopen(name), mock.patch.object(helper, "emit", sent.append):
+                helper.Follower(do_notify=False).refresh()
+            self.assertEqual([(s["kind"], s["ok"]) for s in sent], [("status", False)])
+
+    def test_snapshot_loop_survives_them(self):
+        for name in self.FAILURES:
+            follower = helper.Follower(do_notify=False)
+            follower.dirty = mock.Mock(wait=mock.Mock(side_effect=[False, Stop]))
+            with self.subTest(name), self.urlopen(name), mock.patch.object(helper, "emit"):
+                with self.assertRaises(Stop):
+                    follower.snapshot_loop()
+            self.assertEqual(follower.dirty.wait.call_count, 2)
+
+    def test_reviews_loop_survives_them(self):
+        for name in self.FAILURES:
+            with self.subTest(name), self.urlopen(name), mock.patch.object(helper.time, "sleep", side_effect=Stop):
+                with self.assertRaises(Stop):
+                    helper.Follower(do_notify=False).reviews_loop()
+
+    def test_event_stream_cut_mid_chunk_reconnects(self):
+        class Cut:
+            def __iter__(self):
+                raise http.client.IncompleteRead(b"", 5)
+        sent = []
+        with mock.patch.object(helper.urllib.request, "urlopen", return_value=Cut()), \
+             mock.patch.object(helper, "emit", sent.append), \
+             mock.patch.object(helper.time, "sleep", side_effect=Stop):
+            with self.assertRaises(Stop):
+                helper.Follower(do_notify=False).stream()
+        self.assertEqual([s["ok"] for s in sent], [True, False])
 
 
 class PluginLookup(unittest.TestCase):
