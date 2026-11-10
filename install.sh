@@ -9,6 +9,16 @@ src=$(cd "$(dirname "$0")" && pwd)
 id=screenrig.omarchy
 dest="$HOME/.config/omarchy/plugins/$id"
 
+# The shell reloads a changed plugin at once, which strands a locked screen's
+# lock: refuse while any graphical session of this user is locked.
+for s in $(loginctl list-sessions --no-legend 2>/dev/null | awk -v u="$(id -un)" '$3 == u {print $1}'); do
+  if [[ $(loginctl show-session "$s" -p Type --value 2>/dev/null) =~ ^(wayland|x11)$ &&
+        $(loginctl show-session "$s" -p LockedHint --value 2>/dev/null) == yes ]]; then
+    echo "The screen is locked (session $s): unlock it, then run this again" >&2
+    exit 1
+  fi
+done
+
 if [[ ${1:-} == --uninstall ]]; then
   "$dest/bin/screenrig-omarchy" teardown || true
   omarchy plugin disable "$id" >/dev/null 2>&1 || true
