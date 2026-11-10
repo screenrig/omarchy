@@ -1421,7 +1421,8 @@ def live_start(source, screens, minutes, label):
     server = subprocess.Popen([mediamtx_binary(), mediamtx_config(user, password)],
                               stdout=open(os.path.join(logs, "mediamtx.log"), "w"),
                               stderr=subprocess.STDOUT, start_new_session=True)
-    state = {"server_pid": server.pid, "source": source, "label": label, "screens": screens,
+    # `screens` holds only the screens whose takeover this cast placed, so a failed start ends nothing else.
+    state = {"server_pid": server.pid, "source": source, "label": label, "screens": [],
              "started_at": time.time(), "url": live_url(ip, user, password)}
     started = False
     try:
@@ -1447,7 +1448,7 @@ def live_start(source, screens, minutes, label):
             raise Problem("The capture did not start; see %s" % os.path.join(logs, "recorder.log"))
         playlist = state["playlist_id"] = live_playlist(state["url"])
         until = iso_in(minutes) if minutes > 0 else iso_in(LIVE_LEASE_MIN)
-        shown, failed = [], []
+        shown, failed = state["screens"], []
         for sid in screens:
             try:
                 api("POST", "/api/screens/%s/takeover" % sid,
@@ -1458,7 +1459,7 @@ def live_start(source, screens, minutes, label):
         if not shown:
             raise Problem("No screen took the cast: %s" % "; ".join(failed))
         # `until` is the cast's own end (none until stopped); the lease is the takeover's.
-        state.update(screens=shown, until=until if minutes > 0 else None, lease=minutes <= 0, renewed_at=time.time())
+        state.update(until=until if minutes > 0 else None, lease=minutes <= 0, renewed_at=time.time())
         keepalive = [sys.executable, os.path.realpath(__file__), "live-keepalive"]
         if shutil.which("systemd-inhibit"):
             keepalive = ["systemd-inhibit", "--what=sleep:shutdown", "--mode=delay", "--who=screenRIG",

@@ -311,19 +311,60 @@ class LiveCastStart(unittest.TestCase):
             except subprocess.TimeoutExpired:
                 self.fail("%s is still running" % cmd[0])
 
-    def start(self, source="screen:DP-1"):
-        return helper.live_start(source, ["scr_A"], 30, "Desktop")
+    def start(self, source="screen:DP-1", screens=("scr_A",)):
+        return helper.live_start(source, list(screens), 30, "Desktop")
 
     def live_file(self, name):
         return os.path.join(helper.LIVE_DIR, name)
 
+    def cleared(self):
+        """The screens whose takeover was ended."""
+        return [path.split("/")[3] for method, path, _ in self.calls
+                if method == "DELETE" and path.endswith("/takeover")]
+
     def test_playlist_failure_stops_the_capture(self):
         self.fail_on["playlist"] = helper.Problem("This project holds agent writes for review.")
         with self.assertRaises(helper.Problem):
-            self.start()
+            self.start(screens=("scr_A", "scr_B"))
         self.assertStopped("/fake/mediamtx", "gpu-screen-recorder")
         self.assertFalse(os.path.exists(self.live_file("live.json")))
-        self.assertIn(("DELETE", "/api/screens/scr_A/takeover", None), self.calls)
+        # No takeover was placed, so none is ended: a failed cast leaves the screens' own overrides alone.
+        self.assertEqual(self.cleared(), [])
+        self.assertFalse([c for c in self.calls if c[1].endswith("/takeover")])
+        self.assertFalse([c for c in self.calls if c[0] == "DELETE"])
+
+    def test_capture_that_does_not_start_leaves_the_screens_alone(self):
+        with mock.patch.object(helper, "wait_for_stream", return_value=False), self.assertRaises(helper.Problem):
+            self.start(screens=("scr_A", "scr_B"))
+        self.assertStopped("/fake/mediamtx", "gpu-screen-recorder")
+        self.assertFalse(os.path.exists(self.live_file("live.json")))
+        self.assertEqual(self.cleared(), [])
+
+    def test_failure_while_placing_takeovers_ends_only_those_placed(self):
+        real_api = helper.api
+
+        def flaky(method, path, body=None, **kw):
+            if method == "POST" and path == "/api/screens/scr_B/takeover":
+                raise RuntimeError("unexpected")
+            return real_api(method, path, body, **kw)
+        with mock.patch.object(helper, "api", flaky), self.assertRaises(RuntimeError):
+            self.start(screens=("scr_A", "scr_B", "scr_C"))
+        self.assertStopped("/fake/mediamtx", "gpu-screen-recorder")
+        self.assertFalse(os.path.exists(self.live_file("live.json")))
+        self.assertEqual(self.cleared(), ["scr_A"])
+
+    def test_a_screen_that_refused_is_not_ended_when_the_cast_stops(self):
+        real_api = helper.api
+
+        def refuse_b(method, path, body=None, **kw):
+            if method == "POST" and path == "/api/screens/scr_B/takeover":
+                raise helper.Problem("offline")
+            return real_api(method, path, body, **kw)
+        with mock.patch.object(helper, "api", refuse_b):
+            self.start(screens=("scr_A", "scr_B"))
+        self.assertEqual(helper.live_status()["screens"], ["scr_A"])
+        helper.live_stop()
+        self.assertEqual(self.cleared(), ["scr_A"])
 
     def test_every_screen_refusing_the_takeover_stops_the_capture(self):
         real_api = helper.api
@@ -333,22 +374,25 @@ class LiveCastStart(unittest.TestCase):
                 raise helper.Problem("offline")
             return real_api(method, path, body, **kw)
         with mock.patch.object(helper, "api", refuse), self.assertRaises(helper.Problem):
-            self.start()
+            self.start(screens=("scr_A", "scr_B"))
         self.assertStopped("/fake/mediamtx", "gpu-screen-recorder")
         self.assertFalse(os.path.exists(self.live_file("live.json")))
+        self.assertEqual(self.cleared(), [])
 
     def test_recorder_that_cannot_start_stops_the_server(self):
         self.fail_on["gpu-screen-recorder"] = FileNotFoundError("gpu-screen-recorder")
         with self.assertRaises(FileNotFoundError):
-            self.start()
+            self.start(screens=("scr_A", "scr_B"))
         self.assertStopped("/fake/mediamtx")
         self.assertFalse(os.path.exists(self.live_file("live.json")))
+        self.assertEqual(self.cleared(), [])
 
     def test_unknown_source_stops_the_server(self):
         with self.assertRaises(helper.Problem):
-            self.start("nonsense")
+            self.start("nonsense", screens=("scr_A", "scr_B"))
         self.assertStopped("/fake/mediamtx")
         self.assertFalse(os.path.exists(self.live_file("live.json")))
+        self.assertEqual(self.cleared(), [])
 
     def login(self, url):
         match = re.fullmatch(r"rtsp://([0-9a-f]{16}):([0-9a-f]{32})@192\.0\.2\.10:8554/live", url)
