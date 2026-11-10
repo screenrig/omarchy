@@ -13,10 +13,19 @@ spec = importlib.util.spec_from_loader("helper", loader)
 helper = importlib.util.module_from_spec(spec)
 loader.exec_module(helper)
 
+# JavaScript's \s, which includes U+2028 and U+2029.
+JS_SPACE = "\t\n\v\f\r    -     　﻿"
+
 
 def parse_jsonc(text):
-    """The Omarchy menu strips whole-line // comments, then parses JSON."""
-    return json.loads("\n".join(l for l in text.splitlines() if not l.strip().startswith("//")))
+    """Read a menu file the way Omarchy does: MenuModel.js stripJsonc, then JSON.parse.
+
+    A JavaScript multiline ^ also matches after U+2028 and U+2029, so a line
+    separator inside a label followed by // deletes the rest of that row.
+    """
+    text = re.sub(r"(?:(?<=[\n\r  ])|\A)[%s]*//[^\n]*(?:\n|\Z)" % JS_SPACE, "", text)
+    text = re.sub(r",([%s]*[}\]])" % JS_SPACE, r"\1", text)
+    return json.loads(text)
 
 
 SNAP = {
@@ -54,6 +63,25 @@ class MenuMerge(unittest.TestCase):
         menu = parse_jsonc(helper.merge_menu(once, helper.menu_rows(fewer)))
         self.assertNotIn("screenrig.screens.scr_B", menu)
         self.assertEqual(once.count("screenrig-omarchy:begin"), 1)
+
+    def test_line_separators_in_names_survive_the_omarchy_reader(self):
+        snap = {"screens": [{"id": "scr_A", "label": "Lobby // TV", "online": True, "playing_name": "Loop //x"}],
+                "playlists": [{"id": "pl_1", "name": "Menu //board", "approved": True}]}
+        merged = helper.merge_menu(USER_MENU, helper.menu_rows(snap))
+        menu = parse_jsonc(merged)
+        self.assertIn("style.lockscreen", menu)
+        self.assertEqual(menu["screenrig.screens.scr_A"]["label"], "Lobby // TV")
+        self.assertEqual(menu["screenrig.screens.scr_A.open"]["label"], "Open Lobby // TV")
+        self.assertEqual(menu["screenrig.screens.scr_A"]["description"], "screen online Loop //x")
+        self.assertEqual(menu["screenrig.playlists.pl_1"]["label"], "Menu //board")
+        self.assertEqual(helper.merge_menu(merged, helper.menu_rows(snap)), merged)
+
+    def test_block_written_with_a_raw_line_separator_is_replaced(self):
+        bad = helper.merge_menu(USER_MENU, helper.menu_rows(SNAP)).replace("Lobby TV", "Lobby // TV")
+        with self.assertRaises(ValueError):
+            parse_jsonc(bad)
+        fixed = helper.merge_menu(bad, helper.menu_rows(SNAP))
+        self.assertEqual(parse_jsonc(fixed)["screenrig.screens.scr_A"]["label"], "Lobby TV")
 
     def test_empty_object_has_no_trailing_comma(self):
         menu = parse_jsonc(helper.merge_menu("{\n}\n", helper.menu_rows(SNAP)))

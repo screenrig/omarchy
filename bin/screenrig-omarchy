@@ -1644,8 +1644,10 @@ def teardown():
 
 # ---------------------------------------------------------------------- menu
 
-def jstr(s):
-    return json.dumps(s, ensure_ascii=False)
+def jdump(value, **kw):
+    """JSON for the menu file. Omarchy strips // lines with a JavaScript multiline regex, whose ^ also
+    matches after U+2028 and U+2029, so a label holding one followed by // would lose the rest of its row."""
+    return json.dumps(value, ensure_ascii=False, **kw).replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
 
 
 def menu_rows(snap):
@@ -1698,7 +1700,7 @@ def menu_rows(snap):
 def render_block(rows):
     lines = [MENU_BEGIN]
     for key, row in rows:
-        lines.append("  %s: %s," % (jstr(key), json.dumps(row, ensure_ascii=False, separators=(",", ":"))))
+        lines.append("  %s: %s," % (jdump(key), jdump(row, separators=(",", ":"))))
     lines.append(MENU_END)
     return lines
 
