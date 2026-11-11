@@ -248,6 +248,13 @@ class LiveCastStart(unittest.TestCase):
         root = self.tmp.name
         self.children, self.calls, self.probed = [], [], []
         self.fail_on = {}
+        # What the backend holds: each screen's takeover and the playlists, so the cleanup's checks have answers.
+        self.screens = {sid: {"id": sid, "revision": 5, "takeover": None} for sid in ("scr_A", "scr_B", "scr_C")}
+        self.playlists = {}
+        self.lost = set()          # (method, path) applied by the backend whose reply never arrives
+        self.unreadable = {}       # screen id -> reads that fail before one succeeds
+        self.headers = []          # (method, path, request headers) of each call
+        self.on_write = {}         # (method, path) -> callable run just before the backend sees the write
         real_popen = subprocess.Popen
 
         def popen(cmd, **kw):
@@ -264,10 +271,42 @@ class LiveCastStart(unittest.TestCase):
 
         def api(method, path, body=None, **kw):
             self.calls.append((method, path, body))
+            headers = kw.get("headers") or {}
+            self.headers.append((method, path, headers))
             if method == "POST" and path.endswith("/playlists"):
                 if "playlist" in self.fail_on:
                     raise self.fail_on["playlist"]
-                return {"id": "pl_cast"}
+                pid = "pl_lost" if (method, path) in self.lost else "pl_cast"
+                self.playlists[pid] = body["name"]
+                if (method, path) in self.lost:
+                    raise helper.Uncertain("the answer was cut off")
+                return {"id": pid}
+            if method == "GET" and path.startswith("/api/playlists?"):
+                return {"items": [{"id": pid, "name": name} for pid, name in self.playlists.items()]}
+            if method == "DELETE" and path.startswith("/api/playlists/"):
+                if "playlist_delete" in self.fail_on:
+                    raise self.fail_on["playlist_delete"]
+                self.playlists.pop(path.rsplit("/", 1)[1], None)
+                return {}
+            match = re.fullmatch(r"/api/screens/(\w+)(/takeover)?", path)
+            if match and match.group(1) in self.screens:
+                screen = self.screens[match.group(1)]
+                if method == "GET":
+                    if self.unreadable.get(screen["id"]):
+                        self.unreadable[screen["id"]] -= 1
+                        raise helper.Uncertain("the answer was cut off")
+                    return json.loads(json.dumps(screen))
+                if match.group(2):
+                    if (method, path) in self.on_write:
+                        self.on_write[(method, path)]()
+                    guard = headers.get("If-Match")
+                    if guard is not None and guard != '"%d"' % screen["revision"]:
+                        raise helper.Problem("The screen changed.", 412)
+                    screen["takeover"] = {"playlist_id": body["playlist_id"]} if method == "POST" else None
+                    screen["revision"] += 1
+                    if (method, path) in self.lost:
+                        raise helper.Uncertain("the answer was cut off")
+                    return json.loads(json.dumps(screen))
             return {}
 
         patches = [
@@ -462,6 +501,160 @@ class LiveCastStart(unittest.TestCase):
         self.assertEqual(holders(), [])
         self.assertIn(("DELETE", "/api/playlists/pl_cast", None), self.calls)
 
+    def takeover_of(self, sid):
+        return (self.screens[sid]["takeover"] or {}).get("playlist_id")
+
+    # A takeover or playlist create whose reply is lost may still have been applied.
+
+    def test_takeover_with_a_lost_reply_is_found_and_counted(self):
+        self.lost.add(("POST", "/api/screens/scr_B/takeover"))
+        self.start(screens=("scr_A", "scr_B"))
+        self.assertEqual(helper.live_status()["screens"], ["scr_A", "scr_B"])
+        helper.live_stop()
+        self.assertEqual(self.cleared(), ["scr_A", "scr_B"])
+        self.assertEqual([self.takeover_of("scr_A"), self.takeover_of("scr_B")], [None, None])
+
+    def test_takeover_that_cannot_be_read_back_is_ended_when_the_cast_stops(self):
+        self.lost.add(("POST", "/api/screens/scr_A/takeover"))
+        self.unreadable["scr_A"] = 1
+        with mock.patch.object(helper, "warn"), self.assertRaises(helper.Problem):
+            self.start()
+        self.assertStopped("/fake/mediamtx", "gpu-screen-recorder")
+        self.assertEqual(self.cleared(), ["scr_A"])
+        self.assertIsNone(self.takeover_of("scr_A"))
+        self.assertFalse(os.path.exists(self.live_file("live.json")))
+
+    def test_every_screen_is_recorded_before_its_takeover_is_asked_for(self):
+        recorded = []
+        real = self.on_write
+
+        def before_b():
+            with open(self.live_file("live.json")) as f:
+                recorded.append(json.load(f)["unsure"])
+        real[("POST", "/api/screens/scr_B/takeover")] = before_b
+        self.start(screens=("scr_A", "scr_B"))
+        self.assertEqual(recorded, [["scr_B"]])
+        self.assertEqual(helper.live_status()["unsure"], [])
+
+    def test_playlist_with_a_lost_reply_is_found_by_name_and_deleted(self):
+        self.lost.add(("POST", "/api/projects/prj_1/playlists"))
+        with mock.patch.object(helper, "warn"), self.assertRaises(helper.Problem):
+            self.start(screens=("scr_A", "scr_B"))
+        self.assertStopped("/fake/mediamtx", "gpu-screen-recorder")
+        self.assertEqual(self.playlists, {})
+        self.assertIn(("DELETE", "/api/playlists/pl_lost", None), self.calls)
+        # No screen was asked to take a playlist nobody knew the id of.
+        self.assertFalse([c for c in self.calls if c[1].endswith("/takeover")])
+
+    def test_a_refused_playlist_is_not_searched_for(self):
+        self.fail_on["playlist"] = helper.Problem("This project holds agent writes for review.")
+        with self.assertRaises(helper.Problem):
+            self.start()
+        self.assertFalse([c for c in self.calls if c[0] == "GET"])
+
+    # Only a takeover that is still this cast's playlist is ended or renewed.
+
+    def test_a_takeover_placed_by_someone_else_is_left_alone_when_the_cast_stops(self):
+        self.start(screens=("scr_A", "scr_B"))
+        self.screens["scr_B"]["takeover"] = {"playlist_id": "pl_other"}
+        helper.live_stop()
+        self.assertEqual(self.cleared(), ["scr_A"])
+        self.assertEqual(self.takeover_of("scr_B"), "pl_other")
+
+    def test_a_takeover_placed_between_the_check_and_the_clear_is_left_alone(self):
+        self.start()
+
+        def rival():
+            self.screens["scr_A"]["takeover"] = {"playlist_id": "pl_other"}
+            self.screens["scr_A"]["revision"] += 1
+        self.on_write[("DELETE", "/api/screens/scr_A/takeover")] = rival
+        helper.live_stop()
+        self.assertEqual(self.takeover_of("scr_A"), "pl_other")
+        # The clear was guarded by the revision read with the check, so the backend refused it.
+        sent = [h for m, p, h in self.headers if m == "DELETE" and p == "/api/screens/scr_A/takeover"]
+        self.assertEqual(sent, [{"If-Match": '"6"'}])
+
+    def due_for_renewal(self):
+        """The running cast's state, with its lease due to be renewed."""
+        with open(self.live_file("live.json")) as f:
+            state = json.load(f)
+        state.update(lease=True, renewed_at=0)
+        helper.write_private(self.live_file("live.json"), json.dumps(state))
+
+    def test_renewal_extends_only_takeovers_that_are_still_the_casts(self):
+        self.start(screens=("scr_A", "scr_B"))
+        self.screens["scr_B"]["takeover"] = {"playlist_id": "pl_other"}
+        self.due_for_renewal()
+        self.calls.clear()
+        self.headers.clear()
+        with mock.patch.object(helper, "warn"), self.assertRaises(Stop):
+            helper.keep_alive_loop(self.live_file("live.json"), mock.Mock(wait=mock.Mock(side_effect=[False, Stop])))
+        posts = [(p, h) for m, p, h in self.headers if m == "POST"]
+        self.assertEqual(posts, [("/api/screens/scr_A/takeover", {"If-Match": '"6"'})])
+        self.assertEqual(self.takeover_of("scr_B"), "pl_other")
+        with open(self.live_file("live.json")) as f:
+            self.assertEqual(json.load(f)["screens"], ["scr_A"])
+
+    def test_cast_ends_when_every_screen_shows_something_else(self):
+        self.start()
+        self.screens["scr_A"]["takeover"] = {"playlist_id": "pl_other"}
+        self.due_for_renewal()
+        self.calls.clear()
+        with mock.patch.object(helper, "warn"):
+            ended = helper.keep_alive_loop(self.live_file("live.json"), mock.Mock(wait=mock.Mock(return_value=False)))
+        self.assertEqual(ended, 0)
+        self.assertFalse([c for c in self.calls if c[0] == "POST"])
+        self.assertFalse(os.path.exists(self.live_file("live.json")))
+        self.assertEqual(self.takeover_of("scr_A"), "pl_other")
+        self.assertEqual(self.cleared(), [])
+
+    # Stop ends the capture first and says why anything else could not be undone.
+
+    def test_capture_and_server_end_before_the_api_is_asked_anything(self):
+        self.start()
+        self.calls.clear()
+        real_killpg = helper.os.killpg
+
+        def killpg(pid, sig):
+            self.calls.append(("KILL", pid, None))
+            return real_killpg(pid, sig)
+        with mock.patch.object(helper.os, "killpg", killpg):
+            helper.live_stop()
+        kinds = [m for m, _, _ in self.calls]
+        self.assertEqual(kinds.count("KILL"), 3)
+        self.assertEqual(kinds[:3], ["KILL"] * 3)
+        self.assertNotIn("KILL", kinds[3:])
+        self.assertTrue(kinds[3:])
+
+    def test_unexpected_failures_do_not_leave_the_capture_running_or_skip_the_playlist(self):
+        self.start(screens=("scr_A", "scr_B"))
+        real_api = helper.api
+
+        def broken(method, path, body=None, **kw):
+            if method == "GET" and path.startswith("/api/screens/"):
+                raise KeyError("revision")
+            return real_api(method, path, body, **kw)
+        with mock.patch.object(helper, "api", broken), mock.patch.object(helper, "warn") as warned:
+            helper.live_stop()
+        for cmd, proc in self.children:
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.fail("%s is still running" % cmd[0])
+        self.assertFalse(os.path.exists(self.live_file("live.json")))
+        self.assertEqual(self.playlists, {})
+        self.assertEqual(sum("could not end the takeover" in c.args[0] for c in warned.call_args_list), 2)
+
+    def test_a_playlist_that_cannot_be_deleted_is_logged_with_its_cause(self):
+        self.start()
+        self.fail_on["playlist_delete"] = helper.Problem("A screen still shows this playlist.", 409)
+        with mock.patch.object(helper, "warn") as warned:
+            helper.live_stop()
+        messages = [c.args[0] for c in warned.call_args_list]
+        self.assertEqual(len(messages), 1)
+        self.assertIn("pl_cast", messages[0])
+        self.assertIn("A screen still shows this playlist.", messages[0])
+
 
 class Answer:
     """A urlopen() result whose body can fail the way a dropped connection does."""
@@ -517,6 +710,69 @@ class BadAnswers(unittest.TestCase):
         err = urllib.error.HTTPError("https://api.example.invalid/x", 502, "Bad Gateway", {}, Cut())
         self.addCleanup(err.close)
         return err
+
+    def keyed(self, *answers, **call):
+        """api() against a sequence of answers; returns (result or error, the Idempotency-Key of each request)."""
+        sent = []
+
+        def urlopen(req, timeout=None):
+            sent.append(req.get_header("Idempotency-key"))  # urllib capitalizes header names
+            answer = answers[len(sent) - 1]
+            if isinstance(answer, Exception):
+                raise answer
+            return answer()
+        with mock.patch.object(helper.urllib.request, "urlopen", urlopen), mock.patch.object(helper.time, "sleep"):
+            try:
+                result = helper.api("POST", "/api/screens/scr_A/takeover", {}, **call)
+            except helper.Problem as err:
+                result = err
+        return result, sent
+
+    def http_error(self, code, body=b'{"detail":"no"}'):
+        err = urllib.error.HTTPError("https://api.example.invalid/x", code, "x", {}, io.BytesIO(body))
+        self.addCleanup(err.close)
+        return err
+
+    def test_a_keyed_write_whose_answer_is_lost_is_sent_again_with_the_same_key(self):
+        lost = dict(self.FAILURES)
+        lost["bad gateway"] = lambda: self.http_error(502)
+        lost["no route"] = lambda: urllib.error.URLError("unreachable")
+        for name, make in lost.items():
+            with self.subTest(name):
+                first = make()
+                result, sent = self.keyed(first if isinstance(first, Exception) else make,
+                                          lambda: Answer(b'{"id":"scr_A"}'), idempotent=True)
+                self.assertEqual(result, {"id": "scr_A"})
+                self.assertEqual(len(sent), 2)
+                self.assertTrue(sent[0].startswith("omarchy-"))
+                self.assertEqual(sent[0], sent[1])
+
+    def test_each_keyed_write_has_its_own_key(self):
+        _, first = self.keyed(lambda: Answer(), idempotent=True)
+        _, second = self.keyed(lambda: Answer(), idempotent=True)
+        self.assertNotEqual(first, second)
+
+    def test_a_second_lost_answer_is_uncertain_not_refused(self):
+        result, sent = self.keyed(lambda: Answer(fail=ConnectionResetError("reset")),
+                                  lambda: Answer(fail=TimeoutError("timed out")), idempotent=True)
+        self.assertIsInstance(result, helper.Uncertain)
+        self.assertEqual(len(sent), 2)
+
+    def test_a_refusal_is_final_and_is_not_sent_again(self):
+        result, sent = self.keyed(self.http_error(409), idempotent=True)
+        self.assertIsInstance(result, helper.Problem)
+        self.assertNotIsInstance(result, helper.Uncertain)
+        self.assertEqual((result.status, len(sent)), (409, 1))
+
+    def test_a_write_without_a_key_and_a_plain_read_are_not_sent_again(self):
+        result, sent = self.keyed(lambda: Answer(fail=ConnectionResetError("reset")))
+        self.assertIsInstance(result, helper.Uncertain)
+        self.assertEqual(sent, [None])
+
+    def test_a_read_can_ask_to_be_sent_again(self):
+        result, sent = self.keyed(lambda: Answer(fail=ConnectionResetError("reset")), lambda: Answer(b'{"id":"scr_A"}'),
+                                  retry=True)
+        self.assertEqual((result, sent), ({"id": "scr_A"}, [None, None]))
 
     def test_error_answer_with_a_truncated_body_is_still_its_status(self):
         with mock.patch.object(helper.urllib.request, "urlopen", side_effect=self.cut_error()):

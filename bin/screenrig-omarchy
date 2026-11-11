@@ -47,6 +47,23 @@ _print_lock = threading.Lock()
 class Problem(Exception):
     """An API or local failure with a message a person can act on."""
 
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.status = status
+
+
+class Uncertain(Problem):
+    """No usable answer came back, so the request may still have been applied."""
+
+
+def why(err):
+    """An error with its causes, outermost first, for the log."""
+    parts = []
+    while err is not None and len(parts) < 6:
+        parts.append(str(err) or type(err).__name__)
+        err = err.__cause__
+    return ": ".join(parts)
+
 
 def emit(obj):
     with _print_lock:
@@ -299,7 +316,25 @@ def problem_message(status, body):
         return "HTTP %d" % status
 
 
-def api(method, path, body=None, idempotent=False, raw=False, headers=None, _retried=False):
+def api(method, path, body=None, idempotent=False, raw=False, headers=None, retry=None):
+    """One API call. A keyed call (idempotent=True) whose answer is lost is sent once more with the same
+    Idempotency-Key, so a change the first try made is answered again instead of made twice; retry=True does
+    the same for a read. Raises Uncertain when neither try got a usable answer."""
+    h = dict(headers or {})
+    if idempotent:
+        h.setdefault("Idempotency-Key", "omarchy-" + secrets.token_hex(16))
+    again = idempotent if retry is None else retry
+    for attempt in (1, 2):
+        try:
+            return _send(method, path, body, raw, h)
+        except Uncertain as err:
+            if attempt == 2 or not again:
+                raise
+            warn("%s %s: %s; trying once more" % (method, path, why(err)))
+            time.sleep(1)
+
+
+def _send(method, path, body, raw, headers, _retried=False):
     cfg, token = access_token()
     url = cfg.get("api_url", "https://api.screenrig.ai").rstrip("/") + path
     h = {"Authorization": "Bearer " + token, "Accept": "application/json", "User-Agent": "screenrig-omarchy"}
@@ -307,9 +342,7 @@ def api(method, path, body=None, idempotent=False, raw=False, headers=None, _ret
     if body is not None:
         data = json.dumps(body).encode()
         h["Content-Type"] = "application/json"
-    if idempotent:
-        h["Idempotency-Key"] = "omarchy-" + secrets.token_hex(16)
-    h.update(headers or {})
+    h.update(headers)
     req = urllib.request.Request(url, data=data, method=method, headers=h)
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
@@ -322,13 +355,15 @@ def api(method, path, body=None, idempotent=False, raw=False, headers=None, _ret
         payload = error_body(err)
         if err.code == 401 and not _retried and "invalid_token" in (err.headers.get("WWW-Authenticate") or ""):
             access_token(force=True)
-            return api(method, path, body, idempotent, raw, headers, _retried=True)
-        raise Problem(problem_message(err.code, payload))
+            return _send(method, path, body, raw, headers, _retried=True)
+        message = problem_message(err.code, payload)
+        # A gateway or server failure can follow a change that was applied.
+        raise (Uncertain if err.code >= 500 else Problem)(message, err.code)
     except urllib.error.URLError as err:
-        raise Problem("Cannot reach screenRIG: %s" % err.reason)
+        raise Uncertain("Cannot reach screenRIG: %s" % err.reason) from err
     except (http.client.HTTPException, OSError, ValueError) as err:
         # A body cut short, a reset or timeout while reading it, or a 200 that is not JSON.
-        raise Problem("screenRIG sent an incomplete or unreadable answer: %s" % (str(err) or type(err).__name__)) from err
+        raise Uncertain("screenRIG sent an incomplete or unreadable answer: %s" % (str(err) or type(err).__name__)) from err
 
 
 def paged(path):
@@ -1322,13 +1357,21 @@ def live_project_state():
         return path, {}
 
 
-def live_playlist(url):
+def save_live(state):
+    write_private(os.path.join(LIVE_DIR, "live.json"), json.dumps(state))
+
+
+def live_playlist(url, state):
     """A playlist that plays this cast's stream. Its address carries the cast's login, so every cast
-    makes its own (live_stop deletes it) and the address is never kept in the project state."""
+    makes its own (live_stop deletes it) and the address is never kept in the project state.
+
+    The name is written to `state` before the request, as `playlist_pending`, and stays there while the
+    outcome is unknown: a reply lost after the playlist was made leaves no id, and live_stop finds the
+    playlist by that name."""
     cfg, _ = access_token()
     pid = project_id(cfg)
-    path, state = live_project_state()
-    fallback = state.get("fallback_media_id") if state.get("fallback_version") == FALLBACK_VERSION else None
+    path, project = live_project_state()
+    fallback = project.get("fallback_media_id") if project.get("fallback_version") == FALLBACK_VERSION else None
     if not fallback:
         png = os.path.join(ASSETS, "live-fallback.png")
         if not os.path.exists(png):
@@ -1347,8 +1390,16 @@ def live_playlist(url):
                         "fallback_media_id": fallback, "muted": True,
                         "rect": {"x": 0, "y": 0, "width": 1920, "height": 1080}, "layer": 0, "content_fit": "contain"}],
     }
-    playlist = api("POST", "/api/projects/%s/playlists" % pid,
-                   {"name": "Live cast from %s" % socket.gethostname(), "pages": [page]}, idempotent=True)
+    name = "Live cast from %s (%s)" % (socket.gethostname(), secrets.token_hex(3))
+    state["playlist_pending"] = name
+    save_live(state)
+    try:
+        playlist = api("POST", "/api/projects/%s/playlists" % pid, {"name": name, "pages": [page]}, idempotent=True)
+    except Problem as err:
+        if not isinstance(err, Uncertain):
+            del state["playlist_pending"]  # refused: there is no playlist to look for
+        raise
+    del state["playlist_pending"]
     if "id" not in playlist:
         raise Problem("The live playlist waits for a person's review before it can play.")
     return playlist["id"]
@@ -1369,6 +1420,60 @@ def remember_cast(**fields):
     with open(LAST_CAST + ".tmp", "w") as f:
         json.dump(last, f)
     os.replace(LAST_CAST + ".tmp", LAST_CAST)
+
+
+CAST_REASON = "Live cast from Omarchy"
+
+
+def read_screen(sid):
+    """The screen, or None when it no longer exists."""
+    try:
+        return api("GET", "/api/screens/" + sid, retry=True)
+    except Problem as err:
+        if err.status == 404:
+            return None
+        raise
+
+
+def takeover_is(screen, playlist):
+    """Whether the screen's takeover is this cast's playlist. A takeover someone else placed is never ours."""
+    return bool(playlist) and (screen.get("takeover") or {}).get("playlist_id") == playlist
+
+
+def guarded(screen):
+    """If-Match for the revision just read, so a change made since is refused (412) instead of overwritten."""
+    return {"If-Match": '"%s"' % screen["revision"]} if screen.get("revision") is not None else {}
+
+
+def change_takeover(sid, playlist, method, body=None):
+    """Post or clear a screen's takeover only while it is this cast's. The write is guarded by the revision
+    just read; when the screen changed meanwhile the check is made again. Returns whether the screen's
+    takeover was this cast's and the write was sent."""
+    for _ in range(3):
+        screen = read_screen(sid)
+        if screen is None or not takeover_is(screen, playlist):
+            return False
+        try:
+            api(method, "/api/screens/%s/takeover" % sid, body, idempotent=True, headers=guarded(screen))
+            return True
+        except Problem as err:
+            if err.status != 412:
+                raise
+    raise Problem("The screen kept changing, so its takeover was left alone.")
+
+
+def settle_unsure(state):
+    """Decide the screens whose takeover outcome is unknown: one is the cast's exactly when it shows the
+    cast's playlist as its takeover. A screen that cannot be read now stays in the ledger for live_stop."""
+    for sid in list(state.get("unsure") or []):
+        try:
+            screen = read_screen(sid)
+        except Problem as err:
+            warn("cannot tell whether %s took the cast: %s" % (sid, why(err)))
+            continue
+        state["unsure"].remove(sid)
+        if screen is not None and takeover_is(screen, state.get("playlist_id")):
+            state["screens"].append(sid)
 
 
 def live_status():
@@ -1421,8 +1526,9 @@ def live_start(source, screens, minutes, label):
     server = subprocess.Popen([mediamtx_binary(), mediamtx_config(user, password)],
                               stdout=open(os.path.join(logs, "mediamtx.log"), "w"),
                               stderr=subprocess.STDOUT, start_new_session=True)
-    # `screens` holds only the screens whose takeover this cast placed, so a failed start ends nothing else.
-    state = {"server_pid": server.pid, "source": source, "label": label, "screens": [],
+    # `screens` holds the screens whose takeover this cast placed. `unsure` holds those asked to take it whose
+    # answer was lost; live_stop ends a takeover there only if it is still this cast's playlist.
+    state = {"server_pid": server.pid, "source": source, "label": label, "screens": [], "unsure": [],
              "started_at": time.time(), "url": live_url(ip, user, password)}
     started = False
     try:
@@ -1446,16 +1552,26 @@ def live_start(source, screens, minutes, label):
         # The recorder publishes over loopback, which needs no login; reading does.
         if not wait_for_stream(live_url("127.0.0.1", user, password)):
             raise Problem("The capture did not start; see %s" % os.path.join(logs, "recorder.log"))
-        playlist = state["playlist_id"] = live_playlist(state["url"])
+        playlist = state["playlist_id"] = live_playlist(state["url"], state)
         until = iso_in(minutes) if minutes > 0 else iso_in(LIVE_LEASE_MIN)
         shown, failed = state["screens"], []
         for sid in screens:
+            # Recorded before the request: a takeover whose answer is lost is still ended when the cast stops.
+            state["unsure"].append(sid)
+            save_live(state)
             try:
                 api("POST", "/api/screens/%s/takeover" % sid,
-                    {"playlist_id": playlist, "until": until, "reason": "Live cast from Omarchy"}, idempotent=True)
-                shown.append(sid)
+                    {"playlist_id": playlist, "until": until, "reason": CAST_REASON}, idempotent=True)
+            except Uncertain as err:
+                failed.append(str(err))  # may have been placed; settled below
+                continue
             except Problem as err:
+                state["unsure"].remove(sid)
                 failed.append(str(err))
+                continue
+            state["unsure"].remove(sid)
+            shown.append(sid)
+        settle_unsure(state)
         if not shown:
             raise Problem("No screen took the cast: %s" % "; ".join(failed))
         # `until` is the cast's own end (none until stopped); the lease is the takeover's.
@@ -1525,15 +1641,21 @@ def keep_alive_loop(path, stop_now):
             return 0
         if state.get("lease") and time.time() - state.get("renewed_at", 0) >= LIVE_RENEW_S:
             until = iso_in(LIVE_LEASE_MIN)
-            for sid in state.get("screens") or []:
+            body = {"playlist_id": state["playlist_id"], "until": until, "reason": CAST_REASON}
+            for sid in list(state.get("screens") or []):
                 try:
-                    api("POST", "/api/screens/%s/takeover" % sid,
-                        {"playlist_id": state["playlist_id"], "until": until, "reason": "Live cast from Omarchy"},
-                        idempotent=True)
+                    # Only a takeover that is still this cast's is extended; one someone placed since is theirs.
+                    if not change_takeover(sid, state["playlist_id"], "POST", body):
+                        state["screens"].remove(sid)
+                        warn("%s no longer shows the live cast, so it is not renewed" % sid)
                 except Problem as err:
-                    warn("lease renewal for %s failed: %s" % (sid, err))
+                    warn("lease renewal for %s failed: %s" % (sid, why(err)))
             state["renewed_at"] = time.time()
             write_private(path, json.dumps(state))
+            if not state["screens"]:
+                live_stop()
+                notify("Live cast stopped", "The screens now show other content, so the cast ended.", "normal")
+                return 0
 
 
 def live_stop():
@@ -1543,28 +1665,52 @@ def live_stop():
             state = json.load(f)
     except (OSError, ValueError):
         return "Nothing is live"
-    for sid in state.get("screens") or []:
-        try:
-            api("DELETE", "/api/screens/%s/takeover" % sid, idempotent=True)
-        except Problem:
-            pass
-    for key, sig in (("recorder_pid", signal.SIGINT), ("server_pid", signal.SIGTERM), ("keepalive_pid", signal.SIGTERM)):
-        if state.get(key) and int(state[key]) == os.getpgrp():
-            continue
-        if pid_alive(state.get(key)):
+    # The capture, the RTSP server (whose login the playlist carries) and the keep-alive end first, whatever
+    # the API then does, and the state goes with them so a new cast cannot be mistaken for this one.
+    try:
+        for key, sig in (("keepalive_pid", signal.SIGTERM), ("recorder_pid", signal.SIGINT), ("server_pid", signal.SIGTERM)):
             try:
+                if int(state.get(key) or 0) == os.getpgrp() or not pid_alive(state.get(key)):
+                    continue
                 os.killpg(int(state[key]), sig)
-            except OSError:
-                pass
-    os.remove(path)
-    subprocess.run(["omarchy-shell", "notifications", "dismiss", LIVE_NOTICE], capture_output=True)
-    if state.get("playlist_id"):
+            except (OSError, ValueError) as err:
+                warn("could not end %s: %s" % (key, why(err)))
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        subprocess.run(["omarchy-shell", "notifications", "dismiss", LIVE_NOTICE], capture_output=True)
+    playlist = state.get("playlist_id")
+    # A takeover is ended only while it is still this cast's playlist, including those whose answer was lost.
+    for sid in dict.fromkeys((state.get("screens") or []) + (state.get("unsure") or [])) if playlist else ():
+        try:
+            change_takeover(sid, playlist, "DELETE")
+        except Exception as err:
+            warn("could not end the takeover on %s: %s" % (sid, why(err)))
+    if not playlist and state.get("playlist_pending"):
+        playlist = find_playlist(state["playlist_pending"])
+    if playlist:
         # The playlist's stream address carries the cast's login; the takeovers are gone, so it can go too.
         try:
-            api("DELETE", "/api/playlists/%s" % state["playlist_id"], idempotent=True)
-        except Problem:
-            pass
+            api("DELETE", "/api/playlists/%s" % playlist, idempotent=True)
+        except Problem as err:
+            if err.status != 404:
+                warn("could not delete the live playlist %s: %s" % (playlist, why(err)))
+        except Exception as err:
+            warn("could not delete the live playlist %s: %s" % (playlist, why(err)))
     return "Live cast stopped"
+
+
+def find_playlist(name):
+    """The id of the playlist a lost create answer made (the name is unique to the cast), if it exists."""
+    try:
+        for item in paged("/api/playlists?project=" + project_id(load_config())):
+            if item.get("name") == name and item.get("id"):
+                return item["id"]
+    except Exception as err:
+        warn("could not look for the live playlist %r: %s" % (name, why(err)))
+    return None
 
 
 # --------------------------------------------------------------------- setup
