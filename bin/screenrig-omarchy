@@ -1216,13 +1216,18 @@ def lan_subnet(ip):
             bits = int(m.group(2))
             mask = (0xFFFFFFFF << (32 - bits)) & 0xFFFFFFFF
             n = int.from_bytes(socket.inet_aton(ip), "big") & mask
-            subnet = "%s/%d" % (socket.inet_ntoa(n.to_bytes(4, "big")), bits)
-            # The firewall rule is written from this, and the mask comes from the network (DHCP): open the
-            # stream to a home or office network only, never to a range a network could stretch to everyone.
-            if bits < 16 or not any(ipaddress.ip_network(subnet).subnet_of(net) for net in PRIVATE_NETS):
-                raise Problem("Live casting works on a private network; this one is %s." % subnet)
-            return subnet
+            return "%s/%d" % (socket.inet_ntoa(n.to_bytes(4, "big")), bits)
     return ip + "/32"
+
+
+def rule_subnet(subnet):
+    """The subnet a firewall rule may name. Its mask comes from the network (DHCP): a rule opens the stream
+    to a home or office network only, never to a range a network could stretch to everyone."""
+    net = ipaddress.ip_network(subnet)
+    if net.prefixlen < 16 or not any(net.subnet_of(private) for private in PRIVATE_NETS):
+        raise Problem("The firewall rule for live casting is only made for a private network of /16 or "
+                      "smaller; this one is %s. Allow TCP %d from your screens yourself." % (subnet, LIVE_PORT))
+    return subnet
 
 
 def public_ip():
@@ -1360,12 +1365,12 @@ def live_setup():
     done = []
     state = firewall_state(subnet)
     if state == "needed":
-        subprocess.run(["sudo", "-n", "ufw", "allow", "from", subnet, "to", "any", "port", str(LIVE_PORT),
+        subprocess.run(["sudo", "-n", "ufw", "allow", "from", rule_subnet(subnet), "to", "any", "port", str(LIVE_PORT),
                         "proto", "tcp", "comment", "screenRIG live cast"], capture_output=True, check=True)
         done.append("ufw allows TCP %d from %s" % (LIVE_PORT, subnet))
     elif state == "no-sudo":
         raise Problem("Run once: sudo ufw allow from %s to any port %d proto tcp comment 'screenRIG live cast'"
-                      % (subnet, LIVE_PORT))
+                      % (rule_subnet(subnet), LIVE_PORT))
     return "Live casting is set up" + (": " + "; ".join(done) if done else "")
 
 

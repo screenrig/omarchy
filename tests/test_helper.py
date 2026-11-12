@@ -1045,22 +1045,43 @@ class Hardening(unittest.TestCase):
             return helper.lan_subnet(ip)
 
     def test_firewall_rule_is_only_ever_for_a_private_network(self):
-        self.assertEqual(self.subnet("192.168.1.20", "192.168.1.20/24"), "192.168.1.0/24")
-        self.assertEqual(self.subnet("10.3.4.5", "10.3.4.5/16"), "10.3.0.0/16")
-        for ip, addr in (("10.3.4.5", "10.3.4.5/0"), ("10.3.4.5", "10.3.4.5/8"), ("203.0.113.9", "203.0.113.9/24")):
+        self.assertEqual(helper.rule_subnet(self.subnet("192.168.1.20", "192.168.1.20/24")), "192.168.1.0/24")
+        self.assertEqual(helper.rule_subnet(self.subnet("10.20.4.5", "10.20.4.5/16")), "10.20.0.0/16")
+        for ip, addr in (("10.20.4.5", "10.20.4.5/0"), ("10.20.4.5", "10.20.4.5/8"), ("203.0.113.9", "203.0.113.9/24")):
             with self.assertRaises(helper.Problem):
-                self.subnet(ip, addr)
+                helper.rule_subnet(self.subnet(ip, addr))
+
+    def test_allowing_live_casting_never_writes_a_rule_for_a_wide_network(self):
+        runs = []
+        with mock.patch.object(helper, "lan_ip", return_value="10.0.0.5"), \
+                mock.patch.object(helper, "lan_subnet", return_value="0.0.0.0/0"), \
+                mock.patch.object(helper, "firewall_state", return_value="needed"), \
+                mock.patch.object(helper.subprocess, "run", lambda cmd, **kw: runs.append(cmd)), \
+                self.assertRaises(helper.Problem):
+            helper.live_setup()
+        self.assertEqual(runs, [])
+
+    def test_a_wide_network_without_a_firewall_still_casts(self):
+        # No rule is written when ufw is off, so the width of the network is the person's own business.
+        self.assertEqual(self.subnet("10.0.0.5", "10.0.0.5/8"), "10.0.0.0/8")
+        answers = {"systemctl": subprocess.CompletedProcess([], 0, "", ""),
+                   "sudo": subprocess.CompletedProcess([], 0, "Status: inactive\n", "")}
+        with mock.patch.object(helper, "lan_ip", return_value="10.0.0.5"), \
+                mock.patch.object(helper, "lan_subnet", return_value="10.0.0.0/8"), \
+                mock.patch.object(helper.subprocess, "run", lambda cmd, **kw: answers[cmd[0]]):
+            self.assertEqual(helper.live_setup_status()["firewall"], "inactive")
+            self.assertEqual(helper.live_setup(), "Live casting is set up")
 
     def test_ufw_switched_off_needs_no_rule(self):
         answers = {"systemctl": subprocess.CompletedProcess([], 0, "", ""),
                    "sudo": subprocess.CompletedProcess([], 0, "Status: inactive\n", "")}
         with mock.patch.object(helper.subprocess, "run", lambda cmd, **kw: answers[cmd[0]]):
-            self.assertEqual(helper.firewall_state("10.3.0.0/16"), "inactive")
+            self.assertEqual(helper.firewall_state("192.168.1.0/24"), "inactive")
             answers["sudo"] = subprocess.CompletedProcess([], 0, "Status: active\n\nTo  Action  From\n", "")
-            self.assertEqual(helper.firewall_state("10.3.0.0/16"), "needed")
+            self.assertEqual(helper.firewall_state("192.168.1.0/24"), "needed")
             answers["sudo"] = subprocess.CompletedProcess(
-                [], 0, "Status: active\n\n8554/tcp                   ALLOW       10.3.0.0/16                # screenRIG live cast\n", "")
-            self.assertEqual(helper.firewall_state("10.3.0.0/16"), "ok")
+                [], 0, "Status: active\n\n8554/tcp                   ALLOW       192.168.1.0/24                # screenRIG live cast\n", "")
+            self.assertEqual(helper.firewall_state("192.168.1.0/24"), "ok")
 
     def test_api_is_https_or_this_machine(self):
         self.assertEqual(helper.api_base({}), "https://api.screenrig.ai")

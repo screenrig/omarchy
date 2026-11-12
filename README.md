@@ -81,8 +81,9 @@ stream).
 A window cast asks which window through your desktop's own screen-share
 picker, the same consent every other app gets; the plugin does not touch the
 portal's configuration. Versions before 26.11.3 set
-xdg-desktop-portal-hyprland's `custom_picker_binary`; updating puts your
-previous picker back.
+xdg-desktop-portal-hyprland's `custom_picker_binary`; the plugin puts your
+previous picker back the next time it loads. After `omarchy plugin update`,
+run `screenrig-omarchy setup` to do that at once.
 
 ## Requirements
 
@@ -95,8 +96,8 @@ previous picker back.
   checks it against the SHA-256 pinned in the plugin's source and keeps it in
   `~/.local/share/screenrig-omarchy/bin`; it serves RTSP over TCP on port 8554.
   Each cast has its own random login, which the screens receive in the stream
-  address, and a second one for the capture: nothing else on this laptop or
-  the network can publish to it. Screens reach it on the same
+  address, and a second one that publishing needs, used only by the capture
+  on this laptop. Screens reach it on the same
   network: Android and Linux Players.
 - Agent: Claude Code, Codex or Grok with the screenRIG plugin. The panel
   detects installed integrations and prefers your Omarchy default agent
