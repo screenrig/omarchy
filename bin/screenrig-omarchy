@@ -9,6 +9,7 @@ import base64
 import glob
 import hashlib
 import http.client
+import ipaddress
 import json
 import mimetypes
 import os
@@ -334,9 +335,31 @@ def api(method, path, body=None, idempotent=False, raw=False, headers=None, retr
             time.sleep(1)
 
 
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A request that carries the sign-in is never redirected: the API does not redirect, and following one
+    would hand the sign-in to wherever it points. Downloads and uploads carry none and follow as usual."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if req.has_header("Authorization"):
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+urllib.request.install_opener(urllib.request.build_opener(NoRedirect))
+
+
+def api_base(cfg):
+    """The API origin: https, or plain http only on this machine (a local stack)."""
+    base = cfg.get("api_url", "https://api.screenrig.ai").rstrip("/")
+    parts = urllib.parse.urlsplit(base)
+    if parts.scheme == "https" or (parts.scheme == "http" and parts.hostname in ("localhost", "127.0.0.1", "::1")):
+        return base
+    raise Problem("The screenRIG sign-in names an API address that is not https: %s" % base)
+
+
 def _send(method, path, body, raw, headers, _retried=False):
     cfg, token = access_token()
-    url = cfg.get("api_url", "https://api.screenrig.ai").rstrip("/") + path
+    url = api_base(cfg) + path
     h = {"Authorization": "Bearer " + token, "Accept": "application/json", "User-Agent": "screenrig-omarchy"}
     data = None
     if body is not None:
@@ -415,12 +438,22 @@ def summarize_screen(s, names):
     }
 
 
+SAFE_ID = re.compile(r"[A-Za-z0-9_-]+")
+
+
+def safe_ids(items):
+    """Ids end up in menu commands, file names and API paths: keep only items whose id is a plain token."""
+    return [item for item in items if SAFE_ID.fullmatch(str(item.get("id") or ""))]
+
+
 def snapshot():
     cfg, _ = access_token()
     pid = project_id(cfg)
-    playlists = paged("/api/playlists?project=" + pid)
+    if not SAFE_ID.fullmatch(pid):
+        raise Problem("The screenRIG sign-in names a project id that is not valid.")
+    playlists = safe_ids(paged("/api/playlists?project=" + pid))
     names = {p["id"]: p.get("name") or p["id"] for p in playlists}
-    screens = [summarize_screen(s, names) for s in paged("/api/screens?project=" + pid)
+    screens = [summarize_screen(s, names) for s in safe_ids(paged("/api/screens?project=" + pid))
                if s.get("state") == "active"]
     screens.sort(key=lambda s: (not s["online"], s["label"].lower()))
     return {
@@ -694,6 +727,11 @@ def transcript_add(entry):
         f.write(json.dumps(dict(entry, at=time.time())) + "\n")
 
 
+def one_line(value):
+    """A name as one short line of text, so it cannot add lines to the agent's brief."""
+    return " ".join(re.sub(r"[\x00-\x1f\x7f`#<>]", " ", str(value or "")).split())[:80]
+
+
 def agent_workspace():
     """The agent's working folder: what it is for, and the selected project."""
     work = os.path.join(AGENT_DIR, "workspace")
@@ -707,7 +745,7 @@ def agent_workspace():
         "  media, cards and schedules. The CLI is already signed in to this project.\n"
         "- Check each screen you change with a screenshot before you say it is done.\n"
         "- Answer briefly in plain text; the panel shows your messages in a narrow chat.\n"
-    ) % (cfg.get("project_name") or "", cfg.get("project_id") or "", cfg.get("organization_name") or "")
+    ) % tuple(one_line(cfg.get(k)) for k in ("project_name", "project_id", "organization_name"))
     for name in ("AGENTS.md", "CLAUDE.md"):
         path = os.path.join(work, name)
         try:
@@ -754,12 +792,13 @@ def last_line(text):
 def agent_command(agent, session, text):
     if agent == "codex":
         cmd = ["codex", "exec", "--json", "--skip-git-repo-check"]
-        return cmd + (["resume", session, text] if session else [text])
+        # `--` ends the options, so a message that starts with a dash is still the message.
+        return cmd + (["resume", session] if session else []) + ["--", text]
     if agent == "claude":
-        cmd = ["claude", "-p", text, "--output-format", "stream-json", "--verbose", "--permission-mode", "auto"]
-        return cmd + (["--resume", session] if session else [])
+        cmd = ["claude", "-p", "--output-format", "stream-json", "--verbose", "--permission-mode", "auto"]
+        return cmd + (["--resume", session] if session else []) + ["--", text]
     if agent == "grok":
-        cmd = ["grok", "-p", text, "--output-format", "streaming-messages-json", "--permission-mode", "auto"]
+        cmd = ["grok", "--single=" + text, "--output-format", "streaming-messages-json", "--permission-mode", "auto"]
         return cmd + (["--resume", session] if session else [])
     raise Problem("Install Claude Code, Codex or Grok and the screenRIG plugin to use the panel chat.")
 
@@ -910,6 +949,8 @@ def agent_reset():
 
 
 def open_url(url):
+    if not str(url).startswith("https://"):
+        raise Problem("Not opening an address that is not https: %s" % url)
     subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return url
 
@@ -1141,6 +1182,9 @@ def player_status():
 LIVE_DIR = os.path.join(STATE, "live")
 LIVE_BIN = os.path.join(HOME, ".local", "share", "screenrig-omarchy", "bin")
 MEDIAMTX_VERSION = "v1.21.3"
+# SHA-256 of mediamtx_v1.21.3_linux_amd64.tar.gz. Pinned here, so the download is checked against this
+# source and not against a file served beside it. A new version changes both lines.
+MEDIAMTX_SHA256 = "0a2ea7eba96023631efa1bea7804823a9145b043b6646a8a05798d4ac24ed635"
 LIVE_PORT = 8554
 LIVE_PLATFORMS = ("android", "qt")
 LIVE_NOTICE = "Live cast"
@@ -1161,6 +1205,9 @@ def lan_ip():
     return m.group(1)
 
 
+PRIVATE_NETS = [ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")]
+
+
 def lan_subnet(ip):
     out = subprocess.run(["ip", "-4", "-o", "addr", "show"], capture_output=True, text=True).stdout
     for line in out.splitlines():
@@ -1169,7 +1216,12 @@ def lan_subnet(ip):
             bits = int(m.group(2))
             mask = (0xFFFFFFFF << (32 - bits)) & 0xFFFFFFFF
             n = int.from_bytes(socket.inet_aton(ip), "big") & mask
-            return "%s/%d" % (socket.inet_ntoa(n.to_bytes(4, "big")), bits)
+            subnet = "%s/%d" % (socket.inet_ntoa(n.to_bytes(4, "big")), bits)
+            # The firewall rule is written from this, and the mask comes from the network (DHCP): open the
+            # stream to a home or office network only, never to a range a network could stretch to everyone.
+            if bits < 16 or not any(ipaddress.ip_network(subnet).subnet_of(net) for net in PRIVATE_NETS):
+                raise Problem("Live casting works on a private network; this one is %s." % subnet)
+            return subnet
     return ip + "/32"
 
 
@@ -1210,19 +1262,16 @@ def mediamtx_binary():
     os.makedirs(LIVE_BIN, exist_ok=True)
     base = "https://github.com/bluenviron/mediamtx/releases/download/%s/" % MEDIAMTX_VERSION
     name = "mediamtx_%s_linux_amd64.tar.gz" % MEDIAMTX_VERSION
-    with urllib.request.urlopen(base + "checksums.sha256", timeout=60) as resp:
-        sums = resp.read().decode()
-    expected = next((l.split()[0] for l in sums.splitlines() if l.strip().endswith(name)), None)
-    if not expected:
-        raise Problem("The mediamtx release has no checksum for %s." % name)
     with urllib.request.urlopen(base + name, timeout=300) as resp:
         blob = resp.read()
-    if hashlib.sha256(blob).hexdigest() != expected:
-        raise Problem("The mediamtx download does not match its published checksum.")
+    if hashlib.sha256(blob).hexdigest() != MEDIAMTX_SHA256:
+        raise Problem("The mediamtx download does not match the checksum this plugin expects.")
     import io
     import tarfile
     with tarfile.open(fileobj=io.BytesIO(blob)) as tar:
         member = tar.getmember("mediamtx")
+        if not member.isfile():
+            raise Problem("The mediamtx download is not the expected archive.")
         with tar.extractfile(member) as src, open(path + ".tmp", "wb") as dst:
             dst.write(src.read())
     os.chmod(path + ".tmp", 0o755)
@@ -1244,9 +1293,10 @@ def mediamtx_secret(value):
     return json.dumps("sha256:" + base64.b64encode(hashlib.sha256(value.encode()).digest()).decode())
 
 
-def mediamtx_config(user, password):
-    """Reading `live` takes this cast's login; only this machine may publish. The login is stored
-    hashed, so the file holds nothing to read back."""
+def mediamtx_config(user, password, publisher):
+    """Reading `live` takes this cast's login. Publishing takes the cast's second login (`publisher`, a user
+    and password) and comes from this machine, and a publisher is never replaced: no other program here can
+    put its own picture on the screens. Both logins are stored hashed, so the file holds nothing to read back."""
     os.makedirs(LIVE_DIR, mode=0o700, exist_ok=True)
     path = os.path.join(LIVE_DIR, "mediamtx.yml")
     write_private(path, (
@@ -1257,11 +1307,13 @@ def mediamtx_config(user, password):
         "hls: no\nwebrtc: no\nsrt: no\n"
         "authMethod: internal\n"
         "authInternalUsers:\n"
-        "  - user: any\n    pass:\n    ips: [\"127.0.0.1\", \"::1\"]\n"
+        "  - user: %s\n    pass: %s\n    ips: [\"127.0.0.1\", \"::1\"]\n"
         "    permissions:\n      - action: publish\n        path: live\n"
         "  - user: %s\n    pass: %s\n    ips: []\n"
         "    permissions:\n      - action: read\n        path: live\n"
-        "paths:\n  live:\n" % (LIVE_PORT, mediamtx_secret(user), mediamtx_secret(password))))
+        "paths:\n  live:\n    overridePublisher: no\n"
+        % (LIVE_PORT, mediamtx_secret(publisher[0]), mediamtx_secret(publisher[1]),
+           mediamtx_secret(user), mediamtx_secret(password))))
     return path
 
 
@@ -1477,16 +1529,28 @@ def pid_alive(pid):
         return False
 
 
+def stream_ready(url):
+    """Whether the RTSP server describes the stream, which it does once the recorder publishes. The login
+    travels in a header: on a command line every user of this machine could read it."""
+    parts = urllib.parse.urlsplit(url)
+    login = base64.b64encode(("%s:%s" % (parts.username, parts.password)).encode()).decode()
+    target = "rtsp://%s:%d%s" % (parts.hostname, parts.port, parts.path)
+    ask = "DESCRIBE %s RTSP/1.0\r\nCSeq: 1\r\nAccept: application/sdp\r\nAuthorization: Basic %s\r\n\r\n" % (target, login)
+    try:
+        with socket.create_connection((parts.hostname, parts.port), timeout=5) as conn:
+            conn.sendall(ask.encode())
+            return conn.recv(64).startswith(b"RTSP/1.0 200")
+    except OSError:
+        return False
+
+
 def wait_for_stream(url, seconds=20, recorder=None):
     """Whether the stream came up in time. Gives up at once when the recorder has exited."""
     deadline = time.time() + seconds
     while time.time() < deadline:
         if recorder is not None and recorder.poll() is not None:
             return False
-        probe = subprocess.run(["ffprobe", "-v", "error", "-rtsp_transport", "tcp", "-select_streams", "v:0",
-                                "-show_entries", "stream=codec_name", "-of", "csv=p=0", url],
-                               capture_output=True, text=True, timeout=15)
-        if probe.returncode == 0 and probe.stdout.strip():
+        if stream_ready(url):
             return True
         time.sleep(1)
     return False
@@ -1504,7 +1568,8 @@ def live_start(source, screens, minutes, label):
     logs = os.path.join(CACHE, "live")
     os.makedirs(logs, exist_ok=True)
     user, password = secrets.token_hex(8), secrets.token_hex(16)
-    server = subprocess.Popen([mediamtx_binary(), mediamtx_config(user, password)],
+    publisher = (secrets.token_hex(8), secrets.token_hex(16))
+    server = subprocess.Popen([mediamtx_binary(), mediamtx_config(user, password, publisher)],
                               stdout=open(os.path.join(logs, "mediamtx.log"), "w"),
                               stderr=subprocess.STDOUT, start_new_session=True)
     # `screens` holds the screens whose takeover this cast placed. `unsure` holds those asked to take it whose
@@ -1525,11 +1590,10 @@ def live_start(source, screens, minutes, label):
             "-f", "30", "-s", "1920x1080", "-k", "h264", "-bm", "cbr", "-q", "6000", "-keyint", "1", "-cursor", "yes",
             # Published over RTSP so the description carries a session name; Android's
             # Media3 rejects the empty `s= ` mediamtx writes for RTMP sources.
-            "-c", "rtsp", "-ffmpeg-opts", "rtsp_transport=tcp", "-o", "rtsp://127.0.0.1:%d/live" % LIVE_PORT],
+            "-c", "rtsp", "-ffmpeg-opts", "rtsp_transport=tcp", "-o", live_url("127.0.0.1", *publisher)],
             stdout=open(os.path.join(logs, "recorder.log"), "w"), stderr=subprocess.STDOUT, start_new_session=True)
         state["recorder_pid"] = recorder.pid
         write_private(os.path.join(LIVE_DIR, "live.json"), json.dumps(state))
-        # The recorder publishes over loopback, which needs no login; reading does.
         # A window cast waits for the person to choose the window.
         if not wait_for_stream(live_url("127.0.0.1", user, password), PICK_WAIT_S if source == "window" else 20, recorder):
             if source == "window" and recorder.poll() is not None:
@@ -2052,8 +2116,7 @@ class Follower:
         while True:
             try:
                 cfg, token = access_token()
-                url = "%s/stream/project?project=%s" % (cfg.get("api_url", "https://api.screenrig.ai").rstrip("/"),
-                                                        project_id(cfg))
+                url = "%s/stream/project?project=%s" % (api_base(cfg), project_id(cfg))
                 headers = {"Authorization": "Bearer " + token, "Accept": "text/event-stream",
                            "User-Agent": "screenrig-omarchy"}
                 if cursor:
@@ -2121,6 +2184,10 @@ def flag(args, name, default=None):
 
 def main(argv):
     args = list(argv)
+    # Screenshots, captures and logs are the person's own.
+    for folder in (CACHE, STATE):
+        os.makedirs(folder, mode=0o700, exist_ok=True)
+        os.chmod(folder, 0o700)
     if not args:
         print(__doc__.strip())
         return 2

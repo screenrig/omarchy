@@ -509,6 +509,8 @@ Item {
   // ---------------------------------------------------------------- components
 
   component Label: Text {
+    // Names come from the project: show them as written, never as markup.
+    textFormat: Text.PlainText
     property bool meta: false
     property bool title: false
     color: meta ? root.dim : root.fg
@@ -667,6 +669,7 @@ Item {
       Behavior on border.color { ColorAnimation { duration: root.d(160) } }
       Behavior on color { ColorAnimation { duration: root.d(160) } }
       Text {
+        textFormat: Text.PlainText
         visible: field.glyph !== ""
         x: Style.space(12)
         anchors.verticalCenter: parent.verticalCenter
@@ -712,6 +715,7 @@ Item {
       anchors.centerIn: parent
       spacing: Style.space(8)
       Text {
+        textFormat: Text.PlainText
         text: primary.busy ? "󰔟" : primary.iconText
         visible: text !== ""
         color: root.onAccent
@@ -721,6 +725,7 @@ Item {
         RotationAnimation on rotation { running: primary.busy; from: 0; to: 360; duration: 1100; loops: Animation.Infinite }
       }
       Text {
+        textFormat: Text.PlainText
         text: primary.text
         color: root.onAccent
         font.family: root.fontFamily
@@ -910,6 +915,7 @@ Item {
                   anchors.centerIn: parent
                   spacing: Style.space(8)
                   Text {
+                    textFormat: Text.PlainText
                     anchors.verticalCenter: parent.verticalCenter
                     text: root.svc && root.svc.switching ? "Switching" : (root.svc ? (root.svc.project.name || "Project") : "Project")
                     color: "#EEE9DF"
@@ -917,6 +923,7 @@ Item {
                     font.pixelSize: root.titleSize * 1.25
                   }
                   Text {
+                    textFormat: Text.PlainText
                     anchors.verticalCenter: parent.verticalCenter
                     text: "󰅀"
                     color: root.projectMenu ? root.accent : root.dim
@@ -1319,6 +1326,7 @@ Item {
                             pulse: tile.s.online
                           }
                           Text {
+                            textFormat: Text.PlainText
                             anchors.verticalCenter: parent.verticalCenter
                             text: tile.s.online ? "LIVE" : "OFFLINE"
                             color: tile.s.online ? "white" : root.offlineColor
@@ -1341,6 +1349,7 @@ Item {
                         radius: height / 2
                         color: Util.alpha(root.accent, 0.92)
                         Text {
+                          textFormat: Text.PlainText
                           id: statePill
                           anchors.centerIn: parent
                           text: tile.s.display_off ? "DISPLAY OFF" : "OVERRIDE" + root.minutesLeft(tile.s.takeover_until).toUpperCase()
@@ -1607,6 +1616,7 @@ Item {
                   spacing: Style.space(10)
 
                   Text {
+                    textFormat: Text.PlainText
                     text: "CASTING"
                     color: root.offlineColor
                     font.family: root.fontFamily
@@ -1632,6 +1642,7 @@ Item {
 
                   // Countdown when the cast has an end, else how long it has been live.
                   Text {
+                    textFormat: Text.PlainText
                     text: root.clock(liveNow.untilMs ? liveNow.leftMs : root.tickMs - liveNow.startedMs)
                     color: root.fg
                     font.family: root.fontFamily
@@ -1940,6 +1951,7 @@ Item {
                           border.color: sendRow.picked ? root.accent : root.lineStrong
                           Behavior on color { ColorAnimation { duration: root.d(140) } }
                           Text {
+                            textFormat: Text.PlainText
                             anchors.centerIn: parent
                             text: "󰄬"
                             color: root.onAccent
@@ -2426,6 +2438,7 @@ Item {
                       ColumnLayout {
                         spacing: Style.space(4)
                         Text {
+                          textFormat: Text.PlainText
                           text: Math.round(1284 * previewCard.grow).toLocaleString(Qt.locale(), "f", 0)
                           color: Commons.Color.foreground
                           font.family: root.fontFamily
@@ -2547,6 +2560,7 @@ Item {
                   width: popColumn.width
                   readonly property bool newOrg: index === 0 || root.svc.projects[index - 1].organization !== modelData.organization
                   Text {
+                    textFormat: Text.PlainText
                     visible: projEntry.newOrg
                     leftPadding: Style.space(10)
                     topPadding: Style.space(8)
@@ -2627,6 +2641,7 @@ Item {
                     spacing: Style.space(8)
                     Label { meta: true; text: "Code"; anchors.verticalCenter: parent.verticalCenter }
                     Text {
+                      textFormat: Text.PlainText
                       text: root.svc && root.svc.pendingLogin ? root.svc.pendingLogin.code : ""
                       color: root.accent
                       font.family: root.fontFamily

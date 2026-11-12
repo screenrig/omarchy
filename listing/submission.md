@@ -18,7 +18,7 @@ signage
 
 ### Maintainer notes
 
-On load it adds a marked block of screenRIG rows to ~/.config/omarchy/extensions/omarchy-menu.jsonc, keeping the user's own rows, plus two .desktop entries and a theme-set hook. Live casting asks before changing the system: with ufw on it adds one rule for TCP 8554 from the LAN subnet. A window cast asks which window through the desktop's own screen-share picker; the plugin does not touch the portal's configuration. `screenrig-omarchy teardown` undoes everything the plugin set up. The first live cast downloads mediamtx v1.21.3 and verifies it against the release's published SHA-256. The plugin needs the screenRIG CLI's sign-in.
+On load it adds a marked block of screenRIG rows to ~/.config/omarchy/extensions/omarchy-menu.jsonc, keeping the user's own rows, plus two .desktop entries and a theme-set hook. Live casting asks before changing the system: with ufw on it adds one rule for TCP 8554 from the LAN subnet. A window cast asks which window through the desktop's own screen-share picker; the plugin does not touch the portal's configuration. `screenrig-omarchy teardown` undoes everything the plugin set up. The first live cast downloads mediamtx v1.21.3 and verifies it against a SHA-256 pinned in the plugin's source. The plugin needs the screenRIG CLI's sign-in.
 
 ### Submission checklist
 

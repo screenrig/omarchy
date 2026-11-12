@@ -92,10 +92,11 @@ previous picker back.
   files.
 - Live casting: `gpu-screen-recorder` and `ffmpeg`. On the first cast the
   plugin downloads [mediamtx](https://github.com/bluenviron/mediamtx) v1.21.3,
-  checks it against the release's published SHA-256 and keeps it in
+  checks it against the SHA-256 pinned in the plugin's source and keeps it in
   `~/.local/share/screenrig-omarchy/bin`; it serves RTSP over TCP on port 8554.
   Each cast has its own random login, which the screens receive in the stream
-  address; only this laptop can publish to it. Screens reach it on the same
+  address, and a second one for the capture: nothing else on this laptop or
+  the network can publish to it. Screens reach it on the same
   network: Android and Linux Players.
 - Agent: Claude Code, Codex or Grok with the screenRIG plugin. The panel
   detects installed integrations and prefers your Omarchy default agent
