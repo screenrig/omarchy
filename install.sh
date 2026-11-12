@@ -18,6 +18,18 @@ for s in $(loginctl list-sessions --no-legend 2>/dev/null | awk -v u="$(id -un)"
     exit 1
   fi
 done
+# logind's hint is only set by lockers that report to it; Omarchy's lock is the
+# compositor's, so ask Hyprland too. Over ssh there is no instance in the
+# environment: look at each one this user runs.
+if command -v omarchy-hyprland-session-locked >/dev/null; then
+  for inst in "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"/hypr/*/; do
+    [[ -d $inst ]] || continue
+    if HYPRLAND_INSTANCE_SIGNATURE=$(basename "$inst") omarchy-hyprland-session-locked; then
+      echo "The screen is locked: unlock it, then run this again" >&2
+      exit 1
+    fi
+  done
+fi
 
 if [[ ${1:-} == --uninstall ]]; then
   "$dest/bin/screenrig-omarchy" teardown || true
@@ -42,3 +54,5 @@ if ! enabled; then
   enabled || { echo "Enable failed: run omarchy plugin enable $id right" >&2; exit 1; }
 fi
 echo "Installed $id"
+# A running shell keeps the panel it loaded.
+echo "Run omarchy-restart-shell to load the new panel"
