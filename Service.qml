@@ -314,7 +314,7 @@ Item {
     }
   }
 
-  // `omarchy plugin add` only clones the plugin: link the helper, menus and picker on first load.
+  // `omarchy plugin add` only clones the plugin: link the helper and menus on first load.
   Component.onCompleted: run(["setup"])
 
   Process {

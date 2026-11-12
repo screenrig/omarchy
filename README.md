@@ -64,7 +64,7 @@ screenrig-omarchy teardown && omarchy plugin remove screenrig.omarchy
 
 On first load it adds, and `teardown` removes:
 
-- links `screenrig-omarchy` and `screenrig-share-picker` in `~/.local/bin`;
+- a link to `screenrig-omarchy` in `~/.local/bin`;
 - a generated, marked block of screenRIG rows in
   `~/.config/omarchy/extensions/omarchy-menu.jsonc` (your own rows are kept);
 - two `.desktop` entries (the panel, and "Cast to a screenRIG screen" for files)
@@ -74,14 +74,15 @@ On first load it adds, and `teardown` removes:
 plugin installer for github.com/screenrig/plugin; remove it with that agent's
 plugin commands.
 
-Live casting changes two more things, only after you press **Allow** in the
-Cast tab:
+Live casting changes one more thing, only after you press **Allow** in the
+Cast tab: with ufw on, a rule letting your LAN subnet reach TCP 8554 (the
+stream).
 
-- with ufw on, a rule letting your LAN subnet reach TCP 8554 (the stream);
-- for window casts, xdg-desktop-portal-hyprland's `custom_picker_binary`
-  points at `screenrig-share-picker`, which answers the portal for the window
-  you picked in the panel and runs your previous picker for every other screen
-  share. The previous value is kept and restored by `teardown`.
+A window cast asks which window through your desktop's own screen-share
+picker, the same consent every other app gets; the plugin does not touch the
+portal's configuration. Versions before 26.11.3 set
+xdg-desktop-portal-hyprland's `custom_picker_binary`; updating puts your
+previous picker back.
 
 ## Requirements
 

@@ -219,21 +219,7 @@ class AgentEvents(unittest.TestCase):
                                {"kind": "session", "session": "g1"}])
 
 
-picker_loader = importlib.machinery.SourceFileLoader("picker", os.path.join(HERE, "..", "bin", "screenrig-share-picker"))
-picker_spec = importlib.util.spec_from_loader("picker", picker_loader)
-picker = importlib.util.module_from_spec(picker_spec)
-picker_loader.exec_module(picker)
-
-
 class LiveCast(unittest.TestCase):
-    LIST = ("2514190544[HC>]zen-agent[HT>]Zen Browser[HE>]93906347851936[HA>]"
-            "2514433552[HC>]com.t3tools.T3Code[HT>]T3 Code (Beta)[HE>]93906343531712[HA>]")
-
-    def test_picker_maps_hyprland_address_to_portal_id(self):
-        self.assertEqual(picker.window_id(hex(93906343531712), self.LIST), "2514433552")
-        self.assertEqual(picker.window_id(hex(93906347851936)[2:], self.LIST), "2514190544")
-        self.assertIsNone(picker.window_id("0xdead", self.LIST))
-
     def test_fallback_png_is_a_png(self):
         png = helper.solid_png(4, 2)
         self.assertTrue(png.startswith(b"\x89PNG\r\n\x1a\n") and png.endswith(b"IEND\xaeB`\x82"))
@@ -246,7 +232,7 @@ class LiveCastStart(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         root = self.tmp.name
-        self.children, self.calls, self.probed = [], [], []
+        self.children, self.calls, self.probed, self.waits = [], [], [], []
         self.fail_on = {}
         # What the backend holds: each screen's takeover and the playlists, so the cleanup's checks have answers.
         self.screens = {sid: {"id": sid, "revision": 5, "takeover": None} for sid in ("scr_A", "scr_B", "scr_C")}
@@ -324,7 +310,7 @@ class LiveCastStart(unittest.TestCase):
             mock.patch.object(helper, "lan_subnet", return_value="192.0.2.0/24"),
             mock.patch.object(helper, "firewall_state", return_value="ok"),
             mock.patch.object(helper, "mediamtx_binary", return_value="/fake/mediamtx"),
-            mock.patch.object(helper, "wait_for_stream", lambda url, seconds=20: self.probed.append(url) or True),
+            mock.patch.object(helper, "wait_for_stream", lambda url, seconds=20, recorder=None: self.probed.append(url) or self.waits.append(seconds) or True),
             mock.patch.object(helper.time, "sleep"),
             mock.patch.object(helper.subprocess, "run",
                               return_value=subprocess.CompletedProcess([], 0, "", "")),
@@ -371,6 +357,37 @@ class LiveCastStart(unittest.TestCase):
         self.assertEqual(self.cleared(), [])
         self.assertFalse([c for c in self.calls if c[1].endswith("/takeover")])
         self.assertFalse([c for c in self.calls if c[0] == "DELETE"])
+
+    def test_window_cast_asks_the_desktop_picker_and_leaves_nothing_for_it_to_read(self):
+        self.start(source="window")
+        recorder = next(cmd for cmd, _ in self.children if cmd[0] == "gpu-screen-recorder")
+        self.assertEqual(recorder[1:5], ["-w", "portal", "-restore-portal-session", "no"])
+        # Time for a person to choose the window.
+        self.assertEqual(self.waits, [helper.PICK_WAIT_S])
+        # No pending selection is left on disk for a portal picker to hand to another app.
+        self.assertFalse(os.path.exists(os.path.join(helper.CACHE, "live-pick")))
+
+    def test_window_cast_names_no_window_itself(self):
+        with self.assertRaises(helper.Problem):
+            self.start(source="window:0x5567aa")
+        self.assertStopped("/fake/mediamtx")
+
+    def test_window_cast_whose_picker_was_dismissed_says_so(self):
+        real = helper.subprocess.Popen
+
+        def popen(cmd, **kw):
+            proc = real(cmd, **kw)
+            if cmd[0] != "gpu-screen-recorder":
+                return proc
+            proc.kill()
+            proc.wait()
+            return proc
+        with mock.patch.object(helper.subprocess, "Popen", popen), \
+                mock.patch.object(helper, "wait_for_stream", return_value=False), \
+                self.assertRaises(helper.Problem) as raised:
+            self.start(source="window")
+        self.assertIn("No window was chosen", str(raised.exception))
+        self.assertEqual(self.cleared(), [])
 
     def test_capture_that_does_not_start_leaves_the_screens_alone(self):
         with mock.patch.object(helper, "wait_for_stream", return_value=False), self.assertRaises(helper.Problem):
@@ -898,6 +915,75 @@ class PluginLookup(unittest.TestCase):
                  mock.patch.object(helper.shutil, "which", return_value="/usr/bin/node"):
                 self.assertEqual(helper.cli_command(),
                                  ["/usr/bin/node", os.path.join(caches["codex"], "26.11.275", "cli", "dist", "bin.js")])
+
+
+
+class RetirePicker(unittest.TestCase):
+    """Earlier versions pointed xdg-desktop-portal-hyprland at their own picker; setup puts the desktop's back."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = self.tmp.name
+        self.conf = os.path.join(root, "hypr", "xdph.conf")
+        self.link = os.path.join(root, "bin", "screenrig-share-picker")
+        self.state = os.path.join(root, "state")
+        self.cache = os.path.join(root, "cache")
+        for path in (os.path.dirname(self.conf), os.path.dirname(self.link), self.state, self.cache):
+            os.makedirs(path)
+        self.runs = []
+        patches = [
+            mock.patch.object(helper, "XDPH_CONF", self.conf),
+            mock.patch.object(helper, "PICKER_LINK", self.link),
+            mock.patch.object(helper, "STATE", self.state),
+            mock.patch.object(helper, "CACHE", self.cache),
+            mock.patch.object(helper.subprocess, "run",
+                              lambda cmd, **kw: self.runs.append(cmd) or subprocess.CompletedProcess(cmd, 0, "", "")),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def write(self, path, text):
+        with open(path, "w") as f:
+            f.write(text)
+
+    def read(self, path):
+        with open(path) as f:
+            return f.read()
+
+    def test_restores_the_recorded_picker_and_removes_what_was_left(self):
+        self.write(self.conf, "screencopy {\n    allow_token_by_default = true\n    custom_picker_binary = %s\n}\n" % self.link)
+        self.write(os.path.join(self.state, "xdph-original-picker"), "hyprland-preview-share-picker\n")
+        self.write(os.path.join(self.cache, "live-pick"), "window:0x1")
+        os.symlink("/gone/screenrig-share-picker", self.link)
+        self.assertTrue(helper.retire_picker())
+        self.assertEqual(self.read(self.conf),
+                         "screencopy {\n    allow_token_by_default = true\n    custom_picker_binary = hyprland-preview-share-picker\n}\n")
+        self.assertFalse(os.path.lexists(self.link))
+        self.assertFalse(os.path.exists(os.path.join(self.state, "xdph-original-picker")))
+        self.assertFalse(os.path.exists(os.path.join(self.cache, "live-pick")))
+        self.assertEqual(self.runs, [["systemctl", "--user", "try-restart", "xdg-desktop-portal-hyprland"]])
+        # A second run finds nothing to do and does not restart the portal again.
+        self.assertFalse(helper.retire_picker())
+        self.assertEqual(len(self.runs), 1)
+
+    def test_falls_back_to_the_portal_default_when_no_picker_was_recorded(self):
+        self.write(self.conf, "screencopy {\n    custom_picker_binary = %s\n}\n" % self.link)
+        self.assertTrue(helper.retire_picker())
+        self.assertEqual(self.read(self.conf), "screencopy {\n    custom_picker_binary = hyprland-share-picker\n}\n")
+
+    def test_leaves_a_desktop_that_never_used_it_alone(self):
+        text = "screencopy {\n    custom_picker_binary = hyprland-preview-share-picker\n}\n"
+        self.write(self.conf, text)
+        self.assertFalse(helper.retire_picker())
+        self.assertEqual(self.read(self.conf), text)
+        self.assertEqual(self.runs, [])
+
+    def test_no_portal_config_is_not_created(self):
+        os.remove(self.conf) if os.path.exists(self.conf) else None
+        self.assertFalse(helper.retire_picker())
+        self.assertFalse(os.path.exists(self.conf))
 
 
 if __name__ == "__main__":

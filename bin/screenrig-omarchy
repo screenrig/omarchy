@@ -1148,6 +1148,7 @@ LIVE_NOTICE = "Live cast"
 # vanishes the lease runs out and the screens return to their own content.
 LIVE_LEASE_MIN = 75
 LIVE_RENEW_S = 3600
+PICK_WAIT_S = 120  # a window cast waits this long for the person to choose the window
 ASSETS = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "assets")
 FALLBACK_VERSION = 2
 
@@ -1280,21 +1281,13 @@ def firewall_state(subnet):
     return "needed"
 
 
-def picker_ready():
-    try:
-        with open(XDPH_CONF) as f:
-            return bool(re.search(r"^\s*custom_picker_binary\s*=\s*%s\s*$" % re.escape(PICKER_LINK), f.read(), re.M))
-    except OSError:
-        return False
-
-
 def live_setup_status():
     subnet = lan_subnet(lan_ip())
-    return {"ok": True, "firewall": firewall_state(subnet), "picker": picker_ready(), "subnet": subnet, "port": LIVE_PORT}
+    return {"ok": True, "firewall": firewall_state(subnet), "subnet": subnet, "port": LIVE_PORT}
 
 
 def live_unsetup():
-    """Undo live-setup: drop the ufw rule (when sudo needs no password) and restore the picker."""
+    """Undo live-setup: drop the ufw rule (when sudo needs no password)."""
     done = []
     try:
         subnet = lan_subnet(lan_ip())
@@ -1304,34 +1297,21 @@ def live_unsetup():
         subprocess.run(["sudo", "-n", "ufw", "delete", "allow", "from", subnet, "to", "any", "port", str(LIVE_PORT),
                         "proto", "tcp"], capture_output=True)
         done.append("ufw rule removed")
-    original = os.path.join(STATE, "xdph-original-picker")
-    if picker_ready() and os.path.exists(original):
-        with open(original) as f:
-            previous = f.read().strip() or "hyprland-share-picker"
-        with open(XDPH_CONF) as f:
-            text = f.read()
-        text = re.sub(r"^(\s*custom_picker_binary\s*=\s*).*$", lambda m: m.group(1) + previous, text, count=1, flags=re.M)
-        with open(XDPH_CONF, "w") as f:
-            f.write(text)
-        subprocess.run(["systemctl", "--user", "try-restart", "xdg-desktop-portal-hyprland"], capture_output=True)
-        done.append("screen-share picker restored")
     return "; ".join(done) or "Nothing to undo"
 
 
-def live_setup(firewall=True, picker=True):
-    """The changes live casting needs, made only after the person allows them in the panel."""
+def live_setup():
+    """The change live casting needs, made only after the person allows it in the panel."""
     subnet = lan_subnet(lan_ip())
     done = []
     state = firewall_state(subnet)
-    if firewall and state == "needed":
+    if state == "needed":
         subprocess.run(["sudo", "-n", "ufw", "allow", "from", subnet, "to", "any", "port", str(LIVE_PORT),
                         "proto", "tcp", "comment", "screenRIG live cast"], capture_output=True, check=True)
         done.append("ufw allows TCP %d from %s" % (LIVE_PORT, subnet))
-    elif firewall and state == "no-sudo":
+    elif state == "no-sudo":
         raise Problem("Run once: sudo ufw allow from %s to any port %d proto tcp comment 'screenRIG live cast'"
                       % (subnet, LIVE_PORT))
-    if picker and setup_picker():
-        done.append("window casts answer the screen-share picker")
     return "Live casting is set up" + (": " + "; ".join(done) if done else "")
 
 
@@ -1497,9 +1477,12 @@ def pid_alive(pid):
         return False
 
 
-def wait_for_stream(url, seconds=20):
+def wait_for_stream(url, seconds=20, recorder=None):
+    """Whether the stream came up in time. Gives up at once when the recorder has exited."""
     deadline = time.time() + seconds
     while time.time() < deadline:
+        if recorder is not None and recorder.poll() is not None:
+            return False
         probe = subprocess.run(["ffprobe", "-v", "error", "-rtsp_transport", "tcp", "-select_streams", "v:0",
                                 "-show_entries", "stream=codec_name", "-of", "csv=p=0", url],
                                capture_output=True, text=True, timeout=15)
@@ -1517,8 +1500,6 @@ def live_start(source, screens, minutes, label):
     ip = lan_ip()
     if firewall_state(lan_subnet(ip)) in ("needed", "no-sudo"):
         raise Problem("Allow live casting in the Cast tab first: screens need to reach this laptop.")
-    if source.startswith("window:") and not picker_ready():
-        raise Problem("Allow window casting in the Cast tab first.")
     os.makedirs(LIVE_DIR, mode=0o700, exist_ok=True)
     logs = os.path.join(CACHE, "live")
     os.makedirs(logs, exist_ok=True)
@@ -1533,24 +1514,26 @@ def live_start(source, screens, minutes, label):
     started = False
     try:
         time.sleep(0.6)
-        if source.startswith("window:"):
-            os.makedirs(CACHE, exist_ok=True)
-            with open(os.path.join(CACHE, "live-pick"), "w") as f:
-                f.write(source)
+        if source == "window":
+            # The desktop's own screen-share picker asks which window, as it does for any other app.
             capture = ["-w", "portal", "-restore-portal-session", "no"]
         elif source.startswith("screen:"):
             capture = ["-w", source.split(":", 1)[1]]
         else:
             raise Problem("Unknown live source %s" % source)
-        state["recorder_pid"] = subprocess.Popen(["gpu-screen-recorder"] + capture + [
+        recorder = subprocess.Popen(["gpu-screen-recorder"] + capture + [
             "-f", "30", "-s", "1920x1080", "-k", "h264", "-bm", "cbr", "-q", "6000", "-keyint", "1", "-cursor", "yes",
             # Published over RTSP so the description carries a session name; Android's
             # Media3 rejects the empty `s= ` mediamtx writes for RTMP sources.
             "-c", "rtsp", "-ffmpeg-opts", "rtsp_transport=tcp", "-o", "rtsp://127.0.0.1:%d/live" % LIVE_PORT],
-            stdout=open(os.path.join(logs, "recorder.log"), "w"), stderr=subprocess.STDOUT, start_new_session=True).pid
+            stdout=open(os.path.join(logs, "recorder.log"), "w"), stderr=subprocess.STDOUT, start_new_session=True)
+        state["recorder_pid"] = recorder.pid
         write_private(os.path.join(LIVE_DIR, "live.json"), json.dumps(state))
         # The recorder publishes over loopback, which needs no login; reading does.
-        if not wait_for_stream(live_url("127.0.0.1", user, password)):
+        # A window cast waits for the person to choose the window.
+        if not wait_for_stream(live_url("127.0.0.1", user, password), PICK_WAIT_S if source == "window" else 20, recorder):
+            if source == "window" and recorder.poll() is not None:
+                raise Problem("No window was chosen, so nothing was cast.")
             raise Problem("The capture did not start; see %s" % os.path.join(logs, "recorder.log"))
         playlist = state["playlist_id"] = live_playlist(state["url"], state)
         until = iso_in(minutes) if minutes > 0 else iso_in(LIVE_LEASE_MIN)
@@ -1758,35 +1741,39 @@ def place_link(target, link):
     return True
 
 
-def setup_picker():
-    """Point xdg-desktop-portal-hyprland's picker at the live-cast picker, remembering the old one."""
-    if not (os.path.exists(XDPH_CONF) or shutil.which("xdg-desktop-portal-hyprland")
-            or os.path.exists("/usr/lib/xdg-desktop-portal-hyprland")):
-        return False
+def retire_picker():
+    """Earlier versions answered xdg-desktop-portal-hyprland's picker themselves for window casts. Put the
+    desktop's own picker back and remove what that left behind. Returns whether anything changed."""
+    changed = False
+    original = os.path.join(STATE, "xdph-original-picker")
     try:
         with open(XDPH_CONF) as f:
             text = f.read()
     except OSError:
         text = ""
-    m = re.search(r"^\s*custom_picker_binary\s*=\s*(.+?)\s*$", text, re.M)
-    current = m.group(1) if m else ""
-    if current == PICKER_LINK:
-        return False
-    os.makedirs(STATE, exist_ok=True)
-    with open(os.path.join(STATE, "xdph-original-picker"), "w") as f:
-        f.write((current or "hyprland-share-picker") + "\n")
-    if text:
-        with open(XDPH_CONF + ".bak.screenrig-" + time.strftime("%Y%m%d%H%M%S"), "w") as f:
-            f.write(text)
-    if m:
-        text = text[:m.start(1)] + PICKER_LINK + text[m.end(1):]
-    else:
-        text += "\nscreencopy {\n    custom_picker_binary = %s\n}\n" % PICKER_LINK
-    os.makedirs(os.path.dirname(XDPH_CONF), exist_ok=True)
-    with open(XDPH_CONF, "w") as f:
-        f.write(text)
-    subprocess.run(["systemctl", "--user", "try-restart", "xdg-desktop-portal-hyprland"], capture_output=True)
-    return True
+    m = re.search(r"^[ \t]*custom_picker_binary[ \t]*=[ \t]*(.*?)[ \t]*$", text, re.M)
+    if m and os.path.basename(m.group(1)) == os.path.basename(PICKER_LINK):
+        try:
+            with open(original) as f:
+                previous = f.read().strip()
+        except OSError:
+            previous = ""
+        if not previous or os.path.basename(previous) == os.path.basename(PICKER_LINK):
+            previous = "hyprland-share-picker"
+        with open(XDPH_CONF + ".tmp", "w") as f:
+            f.write(text[:m.start(1)] + previous + text[m.end(1):])
+        os.replace(XDPH_CONF + ".tmp", XDPH_CONF)
+        subprocess.run(["systemctl", "--user", "try-restart", "xdg-desktop-portal-hyprland"], capture_output=True)
+        changed = True
+    if os.path.islink(PICKER_LINK):
+        os.remove(PICKER_LINK)
+        changed = True
+    for path in (original, os.path.join(CACHE, "live-pick")):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    return changed
 
 
 def setup():
@@ -1795,8 +1782,8 @@ def setup():
     bindir = os.path.join(HOME, ".local", "bin")
     if place_link(os.path.join(root, "bin", "screenrig-omarchy"), os.path.join(bindir, "screenrig-omarchy")):
         changed.append("helper")
-    if place_link(os.path.join(root, "bin", "screenrig-share-picker"), PICKER_LINK):
-        changed.append("picker")
+    if retire_picker():
+        changed.append("the desktop's own screen-share picker restored")
     apps = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local", "share"), "applications")
     desktop = False
     for name in ("screenrig-omarchy.desktop", "screenrig-send.desktop"):
@@ -1819,6 +1806,8 @@ def teardown():
     undone = live_unsetup()
     if undone != "Nothing to undo":
         done.append(undone)
+    if retire_picker():
+        done.append("screen-share picker restored")
     if menu_remove():
         done.append("menu rows removed")
     apps = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local", "share"), "applications")
@@ -1827,10 +1816,10 @@ def teardown():
         if os.path.exists(path):
             os.remove(path)
             done.append(os.path.basename(path) + " removed")
-    for link in (os.path.join(HOME, ".local", "bin", "screenrig-omarchy"), PICKER_LINK):
-        if os.path.islink(link):
-            os.remove(link)
-            done.append(os.path.basename(link) + " unlinked")
+    link = os.path.join(HOME, ".local", "bin", "screenrig-omarchy")
+    if os.path.islink(link):
+        os.remove(link)
+        done.append(os.path.basename(link) + " unlinked")
     return "; ".join(done) or "Nothing to undo"
 
 

@@ -28,8 +28,8 @@ screenRIG puts the signage screens around you on your Omarchy desktop. A bar
 chip shows when a screen drops; the panel shows every screen with its latest
 screenshot and what it plays, and reloads, switches, overrides or blanks any of
 them. Cast streams your desktop or one app window live to the Android and Linux
-Players on your network, picked from live thumbnails with the arrow keys, or
-sends a capture, a link or a file for a few minutes. The Agent tab is a chat
+Players on your network, the window chosen in your desktop's own screen-share
+picker, or sends a capture, a link or a file for a few minutes. The Agent tab is a chat
 with your default coding agent and the screenRIG skill: tell it what to put
 on which screen. A project switcher, menu rows for every screen and playlist,
 and notifications round it out.
@@ -39,7 +39,7 @@ and notifications round it out.
 | File | Shows |
 |---|---|
 | `images/screens.png` | Screens: every screen with its screenshot, status and actions |
-| `images/cast.png` | Cast: live thumbnails of the desktop and app windows, local screens |
+| `images/cast.png` | Cast: live thumbnails of each desktop, a window entry, local screens |
 | `images/casting.png` | A live cast running, with its timer and Stop |
 | `images/agent.png` | Agent: a chat that puts sales numbers on a lobby screen |
 

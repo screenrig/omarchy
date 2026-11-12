@@ -2,7 +2,6 @@ import QtQuick
 import QtQuick.Effects
 import QtQuick.Layouts
 import Quickshell
-import Quickshell.Hyprland
 import Quickshell.Io
 import Quickshell.Wayland
 import qs.Commons
@@ -68,7 +67,7 @@ Item {
   property string playerMonitor: ""
   property bool themeSyncOn: false
   property bool playerBusy: false
-  // Live cast: the chosen monitor or window ("screen:NAME" or "window:ADDRESS") and how long.
+  // Live cast: the chosen monitor ("screen:NAME") or "window", and how long.
   property string liveSource: ""
   property string liveLabel: ""
   property int liveMinutes: 0
@@ -345,16 +344,12 @@ Item {
     onTriggered: root.tickMs = Date.now()
   }
 
-  // The monitor or window a live cast captures, for its preview.
+  // The monitor a live cast captures, for its preview. A window cast's window is known only to the portal.
   function captureFor(source) {
     source = String(source || "")
     if (source.indexOf("screen:") === 0) {
       var name = source.slice(7)
       for (var i = 0; i < Quickshell.screens.length; i++) if (Quickshell.screens[i].name === name) return Quickshell.screens[i]
-    } else if (source.indexOf("window:") === 0) {
-      var address = source.slice(7).replace(/^0x/, "")
-      var tops = Hyprland.toplevels.values
-      for (var j = 0; j < tops.length; j++) if (String(tops[j].address).replace(/^0x/, "") === address) return tops[j].wayland
     }
     return null
   }
@@ -377,20 +372,15 @@ Item {
     return (h > 0 ? h + ":" + pad(m) : m) + ":" + pad(sec)
   }
 
-  // Monitors first, then app windows; rebuilt only when the set changes, so thumbnails stay put.
+  // Each monitor, then one entry for a window: the desktop's own screen-share picker asks which one when
+  // the cast starts. Rebuilt only when the set changes, so thumbnails stay put.
   function refreshLiveSources() {
     var out = []
     for (var i = 0; i < Quickshell.screens.length; i++) {
       var sc = Quickshell.screens[i]
       out.push({ id: "screen:" + sc.name, kind: "screen", title: "Desktop", detail: sc.name + "  " + sc.width + "×" + sc.height, capture: sc })
     }
-    var tops = Hyprland.toplevels.values
-    for (var j = 0; j < tops.length; j++) {
-      var t = tops[j]
-      if (!t || !t.wayland) continue
-      out.push({ id: "window:" + t.address, kind: "window", title: t.title || t.wayland.appId || "Window",
-                 detail: t.wayland.appId || "", capture: t.wayland })
-    }
+    out.push({ id: "window", kind: "window", title: "A window", detail: "Choose it when the cast starts", capture: null })
     var key = out.map(function(o) { return o.id }).join(",")
     if (key !== liveSourceKey) {
       liveSourceKey = key
@@ -466,10 +456,8 @@ Item {
   }
 
   property var liveSetup: ({})
-  readonly property bool liveWindowPicked: liveSource.indexOf("window:") === 0
   readonly property bool needsFirewall: liveSetup.firewall === "needed" || liveSetup.firewall === "no-sudo"
-  readonly property bool needsPicker: liveWindowPicked && liveSetup.picker === false
-  readonly property bool needsConsent: sendSource === "live" && (needsFirewall || needsPicker)
+  readonly property bool needsConsent: sendSource === "live" && needsFirewall
   function refreshLiveSetup() {
     if (svc) svc.run(["live-setup-status"], function(ok, message, answer) { if (ok) root.liveSetup = answer })
   }
@@ -487,7 +475,10 @@ Item {
     var ids = selectedIds().filter(function(id) { return allowed[id] })
     if (!ids.length || sending || liveSource === "" || needsConsent) return
     sending = true
-    svc.report(true, "Going live on " + ids.length + " screen" + (ids.length === 1 ? "" : "s"))
+    var pickWindow = liveSource === "window"
+    svc.report(true, pickWindow ? "Choose the window to cast" : "Going live on " + ids.length + " screen" + (ids.length === 1 ? "" : "s"))
+    // The desktop's screen-share picker opens as a window: step out of its way.
+    if (pickWindow) root.close()
     svc.liveStart(liveSource, liveLabel, ids, liveMinutes, function(ok, message) {
       root.sending = false
       svc.report(ok, message)
@@ -2004,19 +1995,11 @@ Item {
                     spacing: Style.space(4)
                     Label { text: "Allow live casting on this laptop"; font.bold: true }
                     Label {
-                      visible: root.needsFirewall
                       Layout.fillWidth: true
                       meta: true
                       wrapMode: Text.Wrap
                       text: "The firewall (ufw) lets screens on " + (root.liveSetup.subnet || "your network") + " reach TCP " + (root.liveSetup.port || 8554)
                         + " here." + (root.liveSetup.firewall === "no-sudo" ? " This needs your password once: Allow shows the command." : "")
-                    }
-                    Label {
-                      visible: root.needsPicker
-                      Layout.fillWidth: true
-                      meta: true
-                      wrapMode: Text.Wrap
-                      text: "Window casts answer the desktop's screen-share picker for the window you pick here; your own picker still handles every other screen share. Uninstalling restores it."
                     }
                   }
                   PrimaryButton {
