@@ -1051,6 +1051,17 @@ class Hardening(unittest.TestCase):
             with self.assertRaises(helper.Problem):
                 self.subnet(ip, addr)
 
+    def test_ufw_switched_off_needs_no_rule(self):
+        answers = {"systemctl": subprocess.CompletedProcess([], 0, "", ""),
+                   "sudo": subprocess.CompletedProcess([], 0, "Status: inactive\n", "")}
+        with mock.patch.object(helper.subprocess, "run", lambda cmd, **kw: answers[cmd[0]]):
+            self.assertEqual(helper.firewall_state("10.3.0.0/16"), "inactive")
+            answers["sudo"] = subprocess.CompletedProcess([], 0, "Status: active\n\nTo  Action  From\n", "")
+            self.assertEqual(helper.firewall_state("10.3.0.0/16"), "needed")
+            answers["sudo"] = subprocess.CompletedProcess(
+                [], 0, "Status: active\n\n8554/tcp                   ALLOW       10.3.0.0/16                # screenRIG live cast\n", "")
+            self.assertEqual(helper.firewall_state("10.3.0.0/16"), "ok")
+
     def test_api_is_https_or_this_machine(self):
         self.assertEqual(helper.api_base({}), "https://api.screenrig.ai")
         self.assertEqual(helper.api_base({"api_url": "http://localhost:8080/"}), "http://localhost:8080")

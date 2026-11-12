@@ -28,6 +28,8 @@ if [[ ${1:-} == --uninstall ]]; then
 fi
 
 mkdir -p "$dest"
+# Files this copy would leave behind from a version before 26.11.3.
+rm -f "$dest/bin/screenrig-share-picker"
 tar -C "$src" --exclude=.git --exclude=__pycache__ --exclude=tests --exclude=listing --exclude=preview.png -cf - . | tar -C "$dest" -xf -
 chmod 755 "$dest/bin/"*
 omarchy plugin validate "$dest"

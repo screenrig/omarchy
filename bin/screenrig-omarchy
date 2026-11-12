@@ -1328,6 +1328,8 @@ def firewall_state(subnet):
     status = subprocess.run(["sudo", "-n", "ufw", "status"], capture_output=True, text=True)
     if status.returncode != 0:
         return "no-sudo"
+    if re.search(r"^Status: inactive", status.stdout, re.M):
+        return "inactive"  # the unit is loaded, but ufw is switched off: nothing blocks the stream
     if re.search(r"^%d/tcp\s+ALLOW\s+%s" % (LIVE_PORT, re.escape(subnet)), status.stdout, re.M):
         return "ok"
     return "needed"

@@ -1593,6 +1593,13 @@ Item {
                     opacity: hasContent ? 1 : 0
                     Behavior on opacity { NumberAnimation { duration: root.d(300) } }
                   }
+                  Label {
+                    anchors.centerIn: parent
+                    visible: !nowCopy.hasContent
+                    text: String(liveNow.info.source || "").indexOf("screen:") === 0 ? "󰍹" : "󰖯"
+                    color: Util.alpha(root.fg, 0.25)
+                    font.pixelSize: root.titleSize * 3
+                  }
                   Rectangle {
                     x: Style.space(12); y: Style.space(12)
                     height: Style.space(26)
