@@ -123,12 +123,13 @@ run `screenrig-omarchy setup` to do that at once.
   port after the server exits is sent nothing.
 - **One process owns a cast.** The stream server and the recorder are its
   children, and the kernel ends them with it however it dies, so neither
-  outlives it. It ends the cast when the time you chose is up (counted on a
-  clock that cannot be set back), when the capture or the server ends, when
-  another program appears on the port, when the cast's state file is gone or
-  another cast's, before sleep, and when you press Stop. Nothing else has to
-  be running for that: not the shell, not the panel.
-
+  outlives it. It ends the cast when the time you chose is up (counted from
+  the moment the stream is up, on a clock that cannot be set back), when a
+  start stalls before the screens show the cast, when the capture or the
+  server ends, when another program appears on the port, when the cast's
+  state file is gone or another cast's, before sleep, and when you press
+  Stop. Nothing else has to be running for that: not the shell, not the
+  panel.
 
 Another account on the same machine can still make a cast fail, by holding
 port 8554 first; it cannot publish to the cast or read it. A
@@ -136,9 +137,10 @@ port 8554 first; it cannot publish to the cast or read it. A
 so its connection cannot be recognised and the plugin refuses to cast (the
 Arch package installs it without them).
 
-The stream is RTSP over TCP with a login and is not encrypted, as Players read
-it today. Whoever can intercept traffic between this machine and a screen on
-your network can watch or alter what is cast, so cast on a network you trust.
+The stream is RTSP over TCP with a login and is not encrypted. Whoever can
+intercept traffic between this machine and a screen on your network (ARP
+spoofing, a rogue access point) can watch or alter what is cast and read the
+cast's login, so cast on a network you trust.
 
 ## Keybindings
 
