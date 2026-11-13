@@ -1960,6 +1960,11 @@ def keep_alive_loop(path, stop_now):
             live_stop()
             notify("Live cast stopped", "The capture ended, so the screens went back to their own content.", "normal")
             return 0
+        if not port_owner_is(state.get("server_pid"), LIVE_PORT):
+            # The screens hold the stream's address and its login; they must not reach another program there.
+            live_stop()
+            notify("Live cast stopped", "Another program is listening on the stream's port, so the cast ended.", "normal")
+            return 0
         if state.get("lease") and time.time() - state.get("renewed_at", 0) >= LIVE_RENEW_S:
             until = iso_in(LIVE_LEASE_MIN)
             body = {"playlist_id": state["playlist_id"], "until": until, "reason": CAST_REASON}

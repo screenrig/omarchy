@@ -660,6 +660,7 @@ class LiveCastStart(unittest.TestCase):
             mock.patch.object(helper, "wait_for_stream",
                               lambda url, seconds, recorder, server: self.probed.append(url) or self.waits.append(seconds) or True),
             mock.patch.object(helper, "await_server"),
+            mock.patch.object(helper, "port_owner_is", return_value=True),
             mock.patch.object(helper.shutil, "which", lambda name: "/usr/bin/" + name),
             mock.patch.object(helper.time, "sleep"),
             mock.patch.object(helper.subprocess, "run",
@@ -1036,6 +1037,15 @@ class LiveCastStart(unittest.TestCase):
         self.assertEqual(self.cleared(), [])
 
     # Stop ends the capture first and says why anything else could not be undone.
+
+    def test_keepalive_ends_the_cast_when_the_stream_port_changes_hands(self):
+        self.start(screens=("scr_A",))
+        with mock.patch.object(helper, "port_owner_is", return_value=False):
+            ended = helper.keep_alive_loop(self.live_file("live.json"), mock.Mock(wait=mock.Mock(return_value=False)))
+        self.assertEqual(ended, 0)
+        self.assertFalse(os.path.exists(self.live_file("live.json")))
+        self.assertEqual(self.cleared(), ["scr_A"])
+        self.assertIn("Another program", helper.notify.call_args[0][1])
 
     def test_capture_and_server_end_before_the_api_is_asked_anything(self):
         self.start()
