@@ -1874,27 +1874,26 @@ def serve_gate(gate, recorder_pid, server_pid, login, done, unchecked):
     before a byte of it is read. A cast is one connection: the recorder does not publish a second time, so
     the port closes once the recorder is in and the login is used once."""
     conn = None
-    with gate:
-        while conn is None:
-            try:
+    try:
+        with gate:
+            while conn is None:
                 candidate, _ = gate.accept()
-            except OSError:
-                return
-            # Asked twice before turning it away: it is the recorder's only connection, and each answer
-            # is a whole check of this connection, so asking again admits nothing else.
-            if peer_is(candidate, recorder_pid) or peer_is(candidate, recorder_pid):
-                conn = candidate
-            else:
-                close_socket(candidate)
-                warn("closed a connection to the capture port that is not the recorder's")
-                if sockets_hidden(recorder_pid):
-                    # No connection can be shown to be the recorder's, so none is let in.
-                    warn("the recorder's sockets cannot be read, so its connection cannot be checked")
-                    unchecked.set()
-                    break
-    if conn is not None:
-        relay_capture(conn, server_pid, login)
-    done()
+                # Asked twice before turning it away: it is the recorder's only connection, and each answer
+                # is a whole check of this connection, so asking again admits nothing else.
+                if peer_is(candidate, recorder_pid) or peer_is(candidate, recorder_pid):
+                    conn = candidate
+                else:
+                    close_socket(candidate)
+                    warn("closed a connection to the capture port that is not the recorder's")
+                    if sockets_hidden(recorder_pid):
+                        # No connection can be shown to be the recorder's, so none is let in.
+                        warn("the recorder's sockets cannot be read, so its connection cannot be checked")
+                        unchecked.set()
+                        break
+        if conn is not None:
+            relay_capture(conn, server_pid, login)
+    finally:
+        done()  # whatever happened here, a cast whose gate is gone ends
 
 
 def end_children(children):
@@ -1918,6 +1917,7 @@ OWNER_ENDINGS = {
     "port": ("Live cast stopped", "Another program is listening on the stream's port, so the cast ended.", "normal"),
     "time": ("Live cast ended", "Its time was up, so the screens went back to their own content.", "low"),
     "screens": ("Live cast stopped", "The screens now show other content, so the cast ended.", "normal"),
+    "failure": ("Live cast stopped", "The cast ran into a problem and ended.", "normal"),
 }
 
 
@@ -1988,12 +1988,13 @@ def live_capture(recorder_args):
     live = {}
 
     def hear_live_start():
-        line = sys.stdin.readline()
         try:
-            seconds = float(json.loads(line)["seconds"])
-        except (ValueError, KeyError, TypeError):
+            seconds = float(json.loads(sys.stdin.readline())["seconds"])
+        except (OSError, ValueError, KeyError, TypeError):
             return end("abandoned")  # live_start is gone, or failed before a screen showed the cast
-        live.update(deadline=time.monotonic() + seconds if seconds > 0 else None, renewed=time.monotonic())
+        live.update(deadline=time.monotonic() + seconds if seconds > 0 else None)
+        if seconds <= 0:
+            keep_lease(generation, ended, end)
 
     def watch_sleep():
         for line in sleep_monitor.stdout:
@@ -2006,10 +2007,14 @@ def live_capture(recorder_args):
     if sleep_monitor is not None:
         threading.Thread(target=watch_sleep, daemon=True).start()
     try:
+        # Nothing in this loop waits on the network: the takeovers' lease is renewed on another thread.
         while not ended.wait(timeout=min(LIVE_CHECK_S, max(0.05, (live.get("deadline") or 1e9) - time.monotonic()))):
             reason = cast_ending(generation, recorder, server, live)
             if reason:
                 end(reason)
+    except Exception as err:
+        warn("the live cast ended on an unexpected failure: %s" % why(err))
+        end("failure")
     finally:
         end_children(children)
     # The state is this cast's to clear unless whoever asked it to stop took it first.
@@ -2036,14 +2041,23 @@ def cast_ending(generation, recorder, server, live):
     state = read_live()
     if state is None or state.get("generation") != generation:
         return "asked"  # stopped or replaced: without its state a cast has no Stop, so it does not go on
-    if live and state.get("lease") and time.monotonic() - live["renewed"] >= LIVE_RENEW_S:
-        live["renewed"] = time.monotonic()
+    return None
+
+
+def keep_lease(generation, ended, end):
+    """Renew the takeovers of a cast that runs until stopped, hourly, until the cast ends. If this stops,
+    the takeovers run out by themselves and the screens go back to their own content."""
+    while not ended.wait(timeout=LIVE_RENEW_S):
+        state = read_live()
+        if state is None or state.get("generation") != generation:
+            return  # stopped or replaced; the owner's own look ends the cast
         try:
             if not renew_lease(state):
-                return "screens"
+                return end("screens")
         except Problem:
-            return "asked"  # the state changed hands while the lease was renewed
-    return None
+            return  # the state changed hands while the lease was renewed
+        except Exception as err:
+            warn("lease renewal failed: %s" % why(err))
 
 
 def renew_lease(state):

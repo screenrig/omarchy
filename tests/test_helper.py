@@ -543,6 +543,14 @@ class CaptureGate(unittest.TestCase):
                 server.accept()
             self.assertIn("not the cast's stream server", warned.call_args[0][0])
 
+    def test_a_gate_that_fails_ends_the_cast(self):
+        with mock.patch.object(helper, "peer_is", side_effect=RuntimeError("unexpected")), \
+                mock.patch.object(helper.threading, "excepthook"):
+            port, ended, _ = self.gate(os.getpid(), os.getpid())
+            sock = socket.create_connection(("127.0.0.1", port))
+            self.addCleanup(sock.close)
+            self.assertTrue(ended.wait(5))
+
     def test_the_gate_lets_nobody_in_when_the_recorder_hides_its_sockets(self):
         with mock.patch.object(helper, "sockets_hidden", return_value=True), mock.patch.object(helper, "warn"):
             port, ended, unchecked = self.gate(1, os.getpid())
@@ -1229,7 +1237,13 @@ class LiveCastStart(unittest.TestCase):
         """What the cast's owner decides at one look, for the running cast."""
         alive = mock.Mock(pid=1, poll=lambda: None)
         return helper.cast_ending(self.state()["generation"], owner.get("recorder", alive), owner.get("server", alive),
-                                  {"deadline": None, "renewed": time.monotonic()} if live is None else live)
+                                  {"deadline": None} if live is None else live)
+
+    def lease_round(self):
+        """One hourly round of the owner's lease thread. Returns why it ended the cast, if it did."""
+        ended = []
+        helper.keep_lease(self.state()["generation"], mock.Mock(wait=mock.Mock(side_effect=[False, True])), ended.append)
+        return ended
 
     def test_renewal_extends_only_takeovers_that_are_still_the_casts(self):
         self.start(screens=("scr_A", "scr_B"))
@@ -1238,15 +1252,27 @@ class LiveCastStart(unittest.TestCase):
         self.calls.clear()
         self.headers.clear()
         with mock.patch.object(helper, "warn"):
-            self.assertIsNone(self.ending(live={"deadline": None, "renewed": time.monotonic() - helper.LIVE_RENEW_S}))
+            self.assertEqual(self.lease_round(), [])
         posts = [(p, h) for m, p, h in self.headers if m == "POST"]
         self.assertEqual(posts, [("/api/screens/scr_A/takeover", {"If-Match": '"6"'})])
         self.assertEqual(self.takeover_of("scr_B"), "pl_other")
         self.assertEqual(self.state()["screens"], ["scr_A"])
-        # Not due again for an hour.
+        # The owner's own look at the cast asks the API nothing: it never waits on the network.
         self.calls.clear()
         self.assertIsNone(self.ending())
         self.assertEqual(self.calls, [])
+        helper.live_stop()
+
+    def test_a_lease_is_not_renewed_for_a_cast_that_was_stopped_or_replaced(self):
+        self.start()
+        self.due_for_renewal()
+        state = self.state()
+        self.calls.clear()
+        helper.write_private(self.live_file("live.json"), json.dumps(dict(state, generation="another")))
+        ended = []
+        helper.keep_lease(state["generation"], mock.Mock(wait=mock.Mock(side_effect=[False, True])), ended.append)
+        self.assertEqual((ended, self.calls), ([], []))
+        helper.write_private(self.live_file("live.json"), json.dumps(state))
         helper.live_stop()
 
     def test_cast_ends_when_every_screen_shows_something_else(self):
@@ -1255,7 +1281,7 @@ class LiveCastStart(unittest.TestCase):
         self.due_for_renewal()
         self.calls.clear()
         with mock.patch.object(helper, "warn"):
-            self.assertEqual(self.ending(live={"deadline": None, "renewed": time.monotonic() - helper.LIVE_RENEW_S}), "screens")
+            self.assertEqual(self.lease_round(), ["screens"])
         self.assertFalse([c for c in self.calls if c[0] == "POST"])
         self.assertEqual(self.takeover_of("scr_A"), "pl_other")
         helper.live_stop()
@@ -1265,9 +1291,9 @@ class LiveCastStart(unittest.TestCase):
         self.assertAlmostEqual(helper.iso_time(self.state()["until"]), time.time() + 30 * 60, delta=5)
         # live_start told the owner how long, and the owner counts it on a clock nobody can set back.
         self.assertAlmostEqual(json.loads(self.told[1])["seconds"], 30 * 60, delta=5)
-        self.assertIsNone(self.ending(live={"deadline": time.monotonic() + 60, "renewed": time.monotonic()}))
+        self.assertIsNone(self.ending(live={"deadline": time.monotonic() + 60}))
         with mock.patch.object(helper.time, "time", return_value=0):  # the wall clock is not what counts
-            self.assertEqual(self.ending(live={"deadline": time.monotonic() - 1, "renewed": time.monotonic()}), "time")
+            self.assertEqual(self.ending(live={"deadline": time.monotonic() - 1}), "time")
         self.assertEqual(helper.iso_time("soon"), 0)
         helper.live_stop()
 
