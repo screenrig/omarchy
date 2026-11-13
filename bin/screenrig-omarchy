@@ -6,6 +6,7 @@ prints one line per snapshot or event until it is stopped.
 """
 
 import base64
+import ctypes
 import glob
 import hashlib
 import http.client
@@ -18,6 +19,7 @@ import secrets
 import shutil
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -1300,16 +1302,17 @@ def mediamtx_secret(value):
 
 def mediamtx_config(user, password, publisher):
     """Reading `live` takes this cast's login. Publishing takes the cast's second login (`publisher`, a user
-    and password) and comes from this machine, and a publisher is never replaced: no other program here can
-    put its own picture on the screens. Both logins are stored hashed, so the file holds nothing to read back."""
+    and password) from this machine, and a publisher is never replaced. That login is held only by the
+    capture process (live_capture), in memory: it is on no command line and in no file. Both logins are
+    stored hashed, so this file holds nothing to read back. RTSP over TCP is the only listener."""
     os.makedirs(LIVE_DIR, mode=0o700, exist_ok=True)
     path = os.path.join(LIVE_DIR, "mediamtx.yml")
     write_private(path, (
         "logLevel: info\n"
         "api: no\nmetrics: no\npprof: no\nplayback: no\n"
-        "rtsp: yes\nrtspAddress: :%d\nrtspTransports: [tcp]\nrtspEncryption: \"no\"\n"
+        "rtsp: yes\nrtspAddress: :%d\nrtspTransports: [tcp]\nrtspEncryption: \"no\"\nrtspAuthMethods: [basic]\n"
         "rtmp: no\n"
-        "hls: no\nwebrtc: no\nsrt: no\n"
+        "hls: no\nwebrtc: no\nsrt: no\nmoq: no\n"
         "authMethod: internal\n"
         "authInternalUsers:\n"
         "  - user: %s\n    pass: %s\n    ips: [\"127.0.0.1\", \"::1\"]\n"
@@ -1551,16 +1554,220 @@ def stream_ready(url):
         return False
 
 
-def wait_for_stream(url, seconds=20, recorder=None):
-    """Whether the stream came up in time. Gives up at once when the recorder has exited."""
+def wait_for_stream(url, seconds, recorder, server):
+    """Whether the stream came up in time. Gives up at once when the recorder has exited, or when the
+    port is no longer the cast's server: the probe carries the screens' login."""
     deadline = time.time() + seconds
     while time.time() < deadline:
-        if recorder is not None and recorder.poll() is not None:
+        if recorder.poll() is not None or not port_owner_is(server.pid, LIVE_PORT):
             return False
         if stream_ready(url):
             return True
         time.sleep(1)
     return False
+
+
+# ------------------------------------------------------------- capture gate
+#
+# The recorder publishes over RTSP and takes its address on its command line, which every account on
+# this machine can read. So the recorder is given no login. It connects to a loopback port of the
+# capture process, which lets in the recorder's own socket and nothing else, and adds the publishing
+# login on the way to the RTSP server.
+
+def tcp_rows():
+    """Every TCP socket here as (local, remote, state, inode), the way /proc/net prints them."""
+    rows = []
+    for table in ("tcp", "tcp6"):
+        try:
+            with open("/proc/net/" + table) as f:
+                lines = f.read().splitlines()[1:]
+        except OSError:
+            continue
+        for line in lines:
+            parts = line.split()
+            if len(parts) > 9:
+                rows.append((parts[1], parts[2], parts[3], parts[9]))
+    return rows
+
+
+def process_sockets(pid):
+    """The inodes of the sockets a process holds open. Empty for a process that is gone or not this user's."""
+    found = set()
+    folder = "/proc/%d/fd" % int(pid)
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return found
+    for name in names:
+        try:
+            match = re.fullmatch(r"socket:\[(\d+)\]", os.readlink(os.path.join(folder, name)))
+        except OSError:
+            continue
+        if match:
+            found.add(match.group(1))
+    return found
+
+
+def port_owner_is(pid, port):
+    """Whether TCP `port` is listened on here, and only by process `pid`. A program that took the port
+    first, or a wildcard beside ours, fails this."""
+    if not pid:
+        return False
+    suffix = ":%04X" % port
+    listeners = {inode for local, _, state, inode in tcp_rows() if state == "0A" and local.endswith(suffix)}
+    return bool(listeners) and listeners <= process_sockets(pid)
+
+
+def peer_is(conn, pid):
+    """Whether the other end of an accepted loopback connection is a socket that process `pid` holds.
+
+    The connection must still be established after the tables were read. One that was reset in between
+    frees its addresses for another socket, and the tables would then describe that one, not this."""
+    def printed(address):
+        return "%08X:%04X" % (struct.unpack("=I", socket.inet_aton(address[0]))[0], address[1])
+    peer, own = printed(conn.getpeername()), printed(conn.getsockname())
+    inodes = {inode for local, remote, _, inode in tcp_rows() if local == peer and remote == own}
+    held = len(inodes) == 1 and inodes <= process_sockets(pid)
+    return held and conn.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, 1)[0] == TCP_ESTABLISHED
+
+
+TCP_ESTABLISHED = 1  # tcpi_state, the first byte of TCP_INFO
+GATE_HEAD_MAX = 64 * 1024
+GATE_BODY_MAX = 1024 * 1024
+
+
+def pump(src, dst):
+    """Copy src to dst until either ends, then close both directions."""
+    try:
+        while True:
+            data = src.recv(65536)
+            if not data:
+                break
+            dst.sendall(data)
+    except OSError:
+        pass
+    finally:
+        for sock in (src, dst):
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+
+def add_login(conn, upstream, login):
+    """Pass the recorder's RTSP requests on with the publishing login added to each, until RECORD: from
+    there the connection carries the stream, and the server asks for no login again."""
+    header = b"Authorization: Basic " + login + b"\r\n"
+    pending = b""
+    while True:
+        head, found, rest = pending.partition(b"\r\n\r\n")
+        size = 0
+        if found:
+            length = re.search(rb"(?im)^content-length:[ \t]*(\d+)[ \t]*$", head)
+            size = int(length.group(1)) if length else 0
+        if size > GATE_BODY_MAX or (not found and len(pending) > GATE_HEAD_MAX):
+            raise OSError("the recorder sent a request that is too large")
+        if not found or len(rest) < size:
+            data = conn.recv(65536)
+            if not data:
+                return False
+            pending += data
+            continue
+        line, _, headers = head.partition(b"\r\n")
+        # The recorder has no login of its own; one it sent would not be ours to forward.
+        kept = [h for h in headers.split(b"\r\n") if h and not h.lower().startswith(b"authorization:")]
+        upstream.sendall(b"\r\n".join([line, header.rstrip(b"\r\n")] + kept) + b"\r\n\r\n" + rest[:size])
+        pending = rest[size:]
+        if line.startswith(b"RECORD "):
+            if pending:
+                upstream.sendall(pending)
+            return True
+
+
+def gate_connection(conn, recorder_pid, server_pid, login):
+    """One connection to the capture port: the recorder's is relayed to the RTSP server, any other is closed
+    before a byte of it is read."""
+    upstream = None
+    try:
+        if not peer_is(conn, recorder_pid):
+            warn("closed a connection to the capture port that is not the recorder's")
+            return
+        # The login and the picture go only to the cast's own server: checked on both sides of the connect.
+        if port_owner_is(server_pid, LIVE_PORT):
+            upstream = socket.create_connection(("127.0.0.1", LIVE_PORT), timeout=5)
+        if upstream is None or not port_owner_is(server_pid, LIVE_PORT):
+            warn("TCP port %d is not the cast's stream server, so the capture was not sent" % LIVE_PORT)
+            return
+        upstream.settimeout(None)
+        for sock in (conn, upstream):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        threading.Thread(target=pump, args=(upstream, conn), daemon=True).start()
+        if add_login(conn, upstream, login):
+            pump(conn, upstream)
+    except OSError as err:
+        warn("the capture connection ended: %s" % why(err))
+    finally:
+        for sock in (conn, upstream):
+            if sock is not None:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                sock.close()
+
+
+def serve_gate(gate, recorder_pid, server_pid, login):
+    while True:
+        try:
+            conn, _ = gate.accept()
+        except OSError:
+            return
+        threading.Thread(target=gate_connection, args=(conn, recorder_pid, server_pid, login), daemon=True).start()
+
+
+def live_capture(recorder_args):
+    """Run the recorder behind the gate, and end with it. The publishing login and the RTSP server's
+    process id arrive on stdin from live_start."""
+    told = json.loads(sys.stdin.readline())
+    login = base64.b64encode(("%s:%s" % tuple(told["login"])).encode())
+    gate = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    gate.bind(("127.0.0.1", 0))
+    gate.listen(8)
+    prctl = ctypes.CDLL(None).prctl
+    # Handlers, not SIG_IGN, which the recorder would inherit: SIGINT is how a cast stops it.
+    signal.signal(signal.SIGINT, lambda *_: None)
+    recorder = subprocess.Popen(
+        ["gpu-screen-recorder"] + list(recorder_args) + ["-o", "rtsp://127.0.0.1:%d/live" % gate.getsockname()[1]],
+        stdin=subprocess.DEVNULL,
+        # PR_SET_PDEATHSIG: the recorder never outlives this process, whatever ends it.
+        preexec_fn=lambda: prctl(1, signal.SIGTERM))
+    signal.signal(signal.SIGTERM, lambda *_: recorder.send_signal(signal.SIGINT))
+    threading.Thread(target=serve_gate, args=(gate, recorder.pid, int(told["server_pid"]), login), daemon=True).start()
+    return 1 if recorder.wait() else 0
+
+
+def start_capture(recorder_args, publisher, server_pid, log):
+    """Start live_capture as its own process group and hand it the publishing login on a pipe."""
+    capture = subprocess.Popen([sys.executable, os.path.realpath(__file__), "live-capture"] + recorder_args,
+                               stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT, text=True,
+                               start_new_session=True)
+    with capture.stdin as pipe:
+        pipe.write(json.dumps({"login": list(publisher), "server_pid": server_pid}) + "\n")
+    return capture
+
+
+def await_server(server, log):
+    """Wait until the RTSP port is the cast's own server. Nothing is sent to the port before that: a
+    program that already held it would be handed the picture and the cast's logins."""
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        if server.poll() is not None:
+            raise Problem("The stream server did not start. Is another program using TCP port %d? See %s"
+                          % (LIVE_PORT, log))
+        if port_owner_is(server.pid, LIVE_PORT):
+            return
+        time.sleep(0.2)
+    raise Problem("TCP port %d is held by another program, so nothing was cast." % LIVE_PORT)
 
 
 def live_start(source, screens, minutes, label):
@@ -1585,7 +1792,7 @@ def live_start(source, screens, minutes, label):
              "started_at": time.time(), "url": live_url(ip, user, password)}
     started = False
     try:
-        time.sleep(0.6)
+        await_server(server, os.path.join(logs, "mediamtx.log"))
         if source == "window":
             # The desktop's own screen-share picker asks which window, as it does for any other app.
             capture = ["-w", "portal", "-restore-portal-session", "no"]
@@ -1593,16 +1800,18 @@ def live_start(source, screens, minutes, label):
             capture = ["-w", source.split(":", 1)[1]]
         else:
             raise Problem("Unknown live source %s" % source)
-        recorder = subprocess.Popen(["gpu-screen-recorder"] + capture + [
+        recorder = start_capture(capture + [
             "-f", "30", "-s", "1920x1080", "-k", "h264", "-bm", "cbr", "-q", "6000", "-keyint", "1", "-cursor", "yes",
             # Published over RTSP so the description carries a session name; Android's
             # Media3 rejects the empty `s= ` mediamtx writes for RTMP sources.
-            "-c", "rtsp", "-ffmpeg-opts", "rtsp_transport=tcp", "-o", live_url("127.0.0.1", *publisher)],
-            stdout=open(os.path.join(logs, "recorder.log"), "w"), stderr=subprocess.STDOUT, start_new_session=True)
+            "-c", "rtsp", "-ffmpeg-opts", "rtsp_transport=tcp"],
+            publisher, server.pid, open(os.path.join(logs, "recorder.log"), "w"))
+        # The capture process leads the recorder's process group, so stopping it stops both.
         state["recorder_pid"] = recorder.pid
         write_private(os.path.join(LIVE_DIR, "live.json"), json.dumps(state))
         # A window cast waits for the person to choose the window.
-        if not wait_for_stream(live_url("127.0.0.1", user, password), PICK_WAIT_S if source == "window" else 20, recorder):
+        if not wait_for_stream(live_url("127.0.0.1", user, password), PICK_WAIT_S if source == "window" else 20,
+                               recorder, server):
             if source == "window" and recorder.poll() is not None:
                 raise Problem("No window was chosen, so nothing was cast.")
             raise Problem("The capture did not start; see %s" % os.path.join(logs, "recorder.log"))
@@ -2320,6 +2529,8 @@ def main(argv):
             msg = live_stop()
         elif cmd == "live-keepalive":
             return live_keepalive()
+        elif cmd == "live-capture":
+            return live_capture(args)
         elif cmd == "setup":
             msg = setup()
         elif cmd == "live-setup-status":
