@@ -1561,10 +1561,12 @@ def pid_alive(pid):
 
 
 def process_birth(pid):
-    """When a process started, in the kernel's clock ticks since boot: with its pid, which process it is."""
+    """When a running process started, in the kernel's clock ticks since boot: with its pid, which process
+    it is. None for one that is gone, or has exited and only waits for its parent to collect it."""
     try:
         with open("/proc/%d/stat" % int(pid)) as f:
-            return f.read().rsplit(")", 1)[1].split()[19]
+            fields = f.read().rsplit(")", 1)[1].split()  # after the name, which may hold spaces and brackets
+        return None if fields[0] in ("Z", "X") else fields[19]
     except (OSError, ValueError, IndexError, TypeError):
         return None
 

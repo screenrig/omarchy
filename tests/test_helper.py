@@ -1136,6 +1136,31 @@ class LiveCastStart(unittest.TestCase):
         self.assertEqual(self.cleared(), ["scr_A"])
         self.assertIsNone(helper.process_birth(None))
 
+    def test_a_process_that_has_exited_but_was_not_collected_is_not_running(self):
+        child = subprocess.Popen([sys.executable, "-I", "-c", "import time; time.sleep(60)"])
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        state = {}
+        helper.record_process(state, "recorder_pid", child.pid)
+        self.assertTrue(helper.cast_process(state, "recorder_pid"))
+        child.kill()
+        os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOWAIT)  # exited, and still in the process table
+        self.assertTrue(helper.pid_alive(child.pid))
+        self.assertFalse(helper.cast_process(state, "recorder_pid"))
+
+    def test_a_process_name_with_spaces_and_brackets_does_not_shift_its_start_time(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        odd = os.path.join(tmp.name, "a) R 1 (b")
+        with open(odd, "w") as f:
+            f.write("#!/bin/sh\nsleep 60\n")
+        os.chmod(odd, 0o755)
+        child = subprocess.Popen([odd])
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        with open("/proc/%d/stat" % child.pid) as f:
+            self.assertEqual(helper.process_birth(child.pid), f.read().split()[-31])
+
     def test_a_new_cast_ends_what_an_earlier_one_left(self):
         # Its recorder died, so it is not live, but its server still holds the port and its screens the takeover.
         self.start(screens=("scr_A",))
