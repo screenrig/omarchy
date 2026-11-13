@@ -7,6 +7,8 @@ import io
 import json
 import os
 import re
+import shutil
+import signal
 import socket
 import stat
 import struct
@@ -224,8 +226,11 @@ class AgentEvents(unittest.TestCase):
 
         def popen(cmd, **kw):
             seen["cmd"] = cmd
-            seen["mode"] = stat.S_IMODE(os.stat(os.path.join(tmp.name, "message.txt")).st_mode)
-            with open(os.path.join(tmp.name, "message.txt")) as f:
+            (name,) = [n for n in os.listdir(tmp.name) if n.startswith("message-")]  # this turn's own file
+            if agent == "grok":
+                self.assertEqual(cmd[cmd.index("--prompt-file") + 1], os.path.join(tmp.name, name))
+            seen["mode"] = stat.S_IMODE(os.stat(os.path.join(tmp.name, name)).st_mode)
+            with open(os.path.join(tmp.name, name)) as f:
                 seen["file"] = f.read()
             echo = "import json, sys; print(json.dumps({'stdin': sys.stdin.read()}))"
             return real([sys.executable, "-I", "-c", echo], **kw)
@@ -235,7 +240,7 @@ class AgentEvents(unittest.TestCase):
                 mock.patch.object(helper, "emit"), mock.patch.object(helper.subprocess, "Popen", popen), \
                 mock.patch.object(helper.signal, "signal"):
             self.assertEqual(helper.agent_send(text), 0)
-        seen["left"] = os.path.exists(os.path.join(tmp.name, "message.txt"))
+        seen["left"] = [n for n in os.listdir(tmp.name) if n.startswith("message-")]
         return seen
 
     def test_the_message_reaches_the_agent_on_no_command_line(self):
@@ -553,71 +558,223 @@ class CaptureGate(unittest.TestCase):
         with mock.patch.object(helper, "port_owner_is", return_value=False), \
                 mock.patch.object(helper, "stream_ready") as probe:
             self.assertFalse(helper.wait_for_stream("rtsp://u:p@127.0.0.1:1/live", 5,
-                                                    mock.Mock(poll=lambda: None), mock.Mock(pid=1)))
+                                                    mock.Mock(poll=lambda: None), 1))
         probe.assert_not_called()
 
     def test_one_unreadable_port_table_does_not_end_the_wait_for_a_window(self):
         with mock.patch.object(helper, "port_owner_is", side_effect=[False, True]), \
                 mock.patch.object(helper, "stream_ready", return_value=True):
             self.assertTrue(helper.wait_for_stream("rtsp://u:p@127.0.0.1:1/live", 5,
-                                                   mock.Mock(poll=lambda: None), mock.Mock(pid=1)))
+                                                   mock.Mock(poll=lambda: None), 1))
 
-    def test_capture_runs_the_recorder_with_no_login_and_ends_with_it(self):
-        """live-capture end to end with a stand-in recorder that publishes one request."""
-        server, live_port = self.listener()
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        seen = os.path.join(tmp.name, "argv")
-        recorder = os.path.join(tmp.name, "gpu-screen-recorder")
-        with open(recorder, "w") as f:
-            # It leaves in its own time: the capture's SIGINT, sent once the connection is over, is not its end.
-            f.write("#!%s -I\nimport signal, socket, sys, urllib.parse\nsignal.signal(signal.SIGINT, signal.SIG_IGN)\n"
-                    "open(%r, 'w').write(' '.join(sys.argv[1:]))\n"
-                    "u = urllib.parse.urlsplit(sys.argv[-1])\ns = socket.create_connection((u.hostname, u.port))\n"
-                    "s.sendall(b'RECORD rtsp://x/live RTSP/1.0\\r\\nCSeq: 1\\r\\n\\r\\npicture')\n"
-                    "s.shutdown(socket.SHUT_WR)\ns.recv(1)\n" % (sys.executable, seen))
-        os.chmod(recorder, 0o755)
-        code = ("import importlib.machinery, importlib.util, sys\n"
-                "loader = importlib.machinery.SourceFileLoader('helper', sys.argv[1])\n"
-                "helper = importlib.util.module_from_spec(importlib.util.spec_from_loader('helper', loader))\n"
-                "loader.exec_module(helper)\nhelper.LIVE_PORT = int(sys.argv[2])\n"
-                "sys.exit(helper.live_capture(['-w', 'portal']))")
-        capture = subprocess.Popen(
-            [sys.executable, "-I", "-c", code, os.path.join(HERE, "..", "bin", "screenrig-omarchy"), str(live_port)],
-            stdin=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            env=dict(os.environ, PATH=tmp.name + os.pathsep + os.environ["PATH"]))
-        self.addCleanup(capture.stderr.close)
-        self.addCleanup(capture.kill)
-        capture.stdin.write(json.dumps({"login": ["pub", "secret"], "server_pid": os.getpid()}) + "\n")
-        capture.stdin.close()
-        server.settimeout(10)
-        upstream = self.accepted(server)
-        upstream.settimeout(10)
-        got = b""
+
+class CastOwner(unittest.TestCase):
+    """live-capture as a real process, with stand-ins for the stream server, the recorder and the desktop."""
+
+    SERVER = """
+import socket, sys
+port = int(open(sys.argv[1]).read())
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", port))
+s.listen(4)
+while True:
+    c, _ = s.accept()
+    with open(sys.argv[1] + ".got", "ab") as f:
         while True:
-            data = upstream.recv(4096)
+            data = c.recv(4096)
             if not data:
                 break
-            got += data
-        self.assertEqual(got, b"RECORD rtsp://x/live RTSP/1.0\r\nAuthorization: Basic " + self.LOGIN
-                         + b"\r\nCSeq: 1\r\n\r\npicture")
-        upstream.close()
-        self.assertEqual(capture.wait(timeout=10), 0, capture.stderr.read())
-        with open(seen) as f:
-            argv = f.read()
+            f.write(data)
+            f.flush()
+"""
+    RECORDER = """
+import os, socket, sys, time, urllib.parse
+with open(os.environ["TRIAL"] + "/recorder.argv", "w") as f:
+    f.write(str(os.getpid()) + " " + " ".join(sys.argv[1:]))
+u = urllib.parse.urlsplit(sys.argv[-1])
+s = socket.create_connection((u.hostname, u.port))
+s.sendall(b"RECORD rtsp://x/live RTSP/1.0\\r\\nCSeq: 1\\r\\n\\r\\npicture")
+time.sleep(60)
+"""
+    NOTE = """
+import os, sys
+with open(os.environ["TRIAL"] + "/notices", "a") as f:
+    f.write(" ".join(sys.argv) + "\\n")
+"""
+    WAIT = "import time\ntime.sleep(60)\n"
+    LOGIN = ("u5e7a11c", "p9d03f6b")
+    OWNER = ("import importlib.machinery, importlib.util, sys\n"
+             "loader = importlib.machinery.SourceFileLoader('helper', sys.argv[1])\n"
+             "helper = importlib.util.module_from_spec(importlib.util.spec_from_loader('helper', loader))\n"
+             "loader.exec_module(helper)\nhelper.LIVE_PORT = int(sys.argv[2])\n"
+             "sys.exit(helper.live_capture(['-w', 'portal']))")
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = self.tmp.name
+        tools = os.path.join(self.root, "bin")
+        os.makedirs(tools)
+        for name, code in (("server", self.SERVER), ("gpu-screen-recorder", self.RECORDER), ("gdbus", self.WAIT),
+                           ("systemd-inhibit", self.WAIT), ("omarchy-shell", self.NOTE),
+                           ("omarchy-notification-send", self.NOTE)):
+            with open(os.path.join(tools, name), "w") as f:
+                f.write("#!%s -I\n%s" % (sys.executable, code))
+            os.chmod(os.path.join(tools, name), 0o755)
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            self.port = probe.getsockname()[1]
+        self.config = os.path.join(self.root, "config")
+        with open(self.config, "w") as f:
+            f.write(str(self.port))
+        self.live = os.path.join(self.root, "state", "screenrig-omarchy", "live")
+        os.makedirs(self.live)
+        self.write_state("g1")
+        self.pids = []
+        self.addCleanup(self.reap)
+
+    def reap(self):
+        for pid in self.pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass  # ended, as it should have
+
+    def write_state(self, generation):
+        with open(os.path.join(self.live, "live.json"), "w") as f:
+            json.dump({"generation": generation, "screens": [], "unsure": []}, f)
+
+    def owner(self):
+        """Start the owner and give it its first message. Returns it and its answer."""
+        answers, status_fd = os.pipe()
+        env = dict(os.environ, PATH=os.path.join(self.root, "bin") + os.pathsep + os.environ["PATH"], TRIAL=self.root,
+                   HOME=self.root, XDG_STATE_HOME=os.path.join(self.root, "state"),
+                   XDG_CACHE_HOME=os.path.join(self.root, "cache"), XDG_CONFIG_HOME=os.path.join(self.root, "config-home"))
+        env.pop("SCREENRIG_CONFIG", None)
+        with open(os.path.join(self.root, "owner.log"), "w") as log:
+            proc = subprocess.Popen(
+                [sys.executable, "-I", "-c", self.OWNER, os.path.join(HERE, "..", "bin", "screenrig-omarchy"), str(self.port)],
+                stdin=subprocess.PIPE, stderr=log, text=True, env=env, pass_fds=[status_fd], start_new_session=True)
+        os.close(status_fd)
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        self.addCleanup(lambda: proc.stdin.closed or proc.stdin.close())
+        self.pids.append(proc.pid)
+        proc.stdin.write(json.dumps({"generation": "g1", "login": list(self.LOGIN), "status_fd": status_fd,
+                                     "server": os.path.join(self.root, "bin", "server"), "config": self.config,
+                                     "server_log": os.path.join(self.root, "server.log")}) + "\n")
+        proc.stdin.flush()
+        with os.fdopen(answers) as status:
+            answer = json.loads(status.readline() or "{}")
+        if "server_pid" in answer:
+            self.pids.append(answer["server_pid"])
+        return proc, answer
+
+    def read(self, name):
+        try:
+            with open(os.path.join(self.root, name), "rb") as f:
+                return f.read()
+        except OSError:
+            return b""
+
+    def until(self, check, seconds=10):
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if check():
+                return True
+            time.sleep(0.05)
+        return check()
+
+    def publishing(self):
+        """An owner whose recorder is publishing through it. Returns the owner and its children's pids."""
+        proc, answer = self.owner()
+        self.assertTrue(self.until(lambda: b"picture" in self.read("config.got")), self.read("owner.log"))
+        recorder_pid = int(self.read("recorder.argv").split()[0])
+        self.pids.append(recorder_pid)
+        return proc, [answer["server_pid"], recorder_pid]
+
+    def assertGone(self, pids):
+        self.assertTrue(self.until(lambda: all(helper.process_birth(pid) is None for pid in pids), 8),
+                        "the stream server and the recorder end with the owner")
+
+    def test_the_recorder_gets_no_login_and_the_server_gets_it_from_the_owner(self):
+        proc, children = self.publishing()
+        self.assertEqual(self.read("config.got"), b"RECORD rtsp://x/live RTSP/1.0\r\nAuthorization: Basic "
+                         + base64.b64encode(":".join(self.LOGIN).encode()) + b"\r\nCSeq: 1\r\n\r\npicture")
+        argv = self.read("recorder.argv").decode().split(" ", 1)[1]
         self.assertRegex(argv, r"^-w portal -o rtsp://127\.0\.0\.1:\d+/live$")
-        for secret in ("pub", "secret", self.LOGIN.decode()):
-            self.assertNotIn(secret, argv)
+        with open("/proc/%d/cmdline" % proc.pid, "rb") as f:
+            line = f.read()
+        for secret in [part.encode() for part in self.LOGIN] + [base64.b64encode(":".join(self.LOGIN).encode())]:
+            self.assertNotIn(secret, line)
+            self.assertNotIn(secret.decode(), argv)
+        proc.terminate()
+        self.assertEqual(proc.wait(timeout=10), 0)
+        self.assertGone(children)
+
+    def test_a_timed_cast_ends_when_its_time_is_up_with_nothing_else_running(self):
+        proc, children = self.publishing()
+        proc.stdin.write(json.dumps({"seconds": 1}) + "\n")
+        proc.stdin.close()
+        self.assertEqual(proc.wait(timeout=10), 0)
+        self.assertGone(children)
+        self.assertFalse(os.path.exists(os.path.join(self.live, "live.json")), "the owner cleared its own state")
+        self.assertIn(b"omarchy-notification-send", self.read("notices"))
+        self.assertIn(b"time was up", self.read("notices"))
+
+    def test_a_cast_that_is_never_told_it_is_live_ends(self):
+        # live_start died, or failed before any screen showed the cast.
+        proc, children = self.publishing()
+        proc.stdin.close()
+        self.assertEqual(proc.wait(timeout=10), 1)
+        self.assertGone(children)
+        self.assertNotIn(b"omarchy-notification-send", self.read("notices"))
+
+    def test_the_server_and_the_recorder_die_with_an_owner_that_is_killed(self):
+        proc, children = self.publishing()
+        proc.stdin.write(json.dumps({"seconds": 0}) + "\n")
+        proc.stdin.close()
+        proc.kill()
+        proc.wait()
+        self.assertGone(children)
+
+    def test_a_cast_whose_state_was_taken_or_replaced_ends(self):
+        for change in (lambda: os.remove(os.path.join(self.live, "live.json")), lambda: self.write_state("g2")):
+            self.write_state("g1")
+            for name in ("config.got", "recorder.argv"):
+                if os.path.exists(os.path.join(self.root, name)):
+                    os.remove(os.path.join(self.root, name))
+            proc, children = self.publishing()
+            proc.stdin.write(json.dumps({"seconds": 0}) + "\n")
+            proc.stdin.close()
+            change()
+            self.assertEqual(proc.wait(timeout=10), 0)
+            self.assertGone(children)
+        # The state it found was another cast's, and it left it alone.
+        with open(os.path.join(self.live, "live.json")) as f:
+            self.assertEqual(json.load(f)["generation"], "g2")
+
+    def test_a_port_that_another_program_holds_is_said_and_nothing_is_captured(self):
+        holder = socket.socket()
+        holder.bind(("127.0.0.1", self.port))
+        holder.listen(1)
+        self.addCleanup(holder.close)
+        proc, answer = self.owner()
+        self.assertIn("TCP port %d" % self.port, answer["problem"])
+        self.assertEqual(proc.wait(timeout=10), 1)
+        self.assertEqual(self.read("recorder.argv"), b"", "the recorder was never started")
 
 
 class LiveCastStart(unittest.TestCase):
-    """live_start with the recorder, mediamtx and the keep-alive replaced by idle processes."""
+    """live_start with the cast's owner process replaced by an idle one that answers as the owner does."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         root = self.tmp.name
         self.children, self.calls, self.probed, self.waits, self.told = [], [], [], [], []
+        self.real_popen, self.real_sleep = subprocess.Popen, time.sleep
         self.fail_on = {}
         # What the backend holds: each screen's takeover and the playlists, so the cleanup's checks have answers.
         self.screens = {sid: {"id": sid, "revision": 5, "takeover": None} for sid in ("scr_A", "scr_B", "scr_C")}
@@ -642,9 +799,13 @@ class LiveCastStart(unittest.TestCase):
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                               start_new_session=kw.get("start_new_session", False))
             if proc.stdin is not None:
-                # What live_start tells the capture on its pipe.
+                # What live_start tells the owner on its pipe.
                 write = proc.stdin.write
                 proc.stdin.write = lambda text: self.told.append(text) or write(text)
+            for fd in kw.get("pass_fds", ()):
+                # The owner's answer: the stream server it started (here, itself), or why it could not.
+                answer = {"problem": self.fail_on["server"]} if "server" in self.fail_on else {"server_pid": proc.pid}
+                os.write(fd, (json.dumps(answer) + "\n").encode())
             self.children.append((cmd, proc))
             return proc
 
@@ -705,7 +866,6 @@ class LiveCastStart(unittest.TestCase):
             mock.patch.object(helper, "mediamtx_binary", return_value="/fake/mediamtx"),
             mock.patch.object(helper, "wait_for_stream",
                               lambda url, seconds, recorder, server: self.probed.append(url) or self.waits.append(seconds) or True),
-            mock.patch.object(helper, "await_server"),
             mock.patch.object(helper, "port_owner_is", return_value=True),
             mock.patch.object(helper.shutil, "which", lambda name: "/usr/bin/" + name),
             mock.patch.object(helper.time, "sleep"),
@@ -748,7 +908,7 @@ class LiveCastStart(unittest.TestCase):
         self.fail_on["playlist"] = helper.Problem("This project holds agent writes for review.")
         with self.assertRaises(helper.Problem):
             self.start(screens=("scr_A", "scr_B"))
-        self.assertStopped("/fake/mediamtx", "live-capture")
+        self.assertStopped("live-capture")
         self.assertFalse(os.path.exists(self.live_file("live.json")))
         # No takeover was placed, so none is ended: a failed cast leaves the screens' own overrides alone.
         self.assertEqual(self.cleared(), [])
@@ -767,29 +927,28 @@ class LiveCastStart(unittest.TestCase):
     def test_window_cast_names_no_window_itself(self):
         with self.assertRaises(helper.Problem):
             self.start(source="window:0x5567aa")
-        self.assertStopped("/fake/mediamtx")
+        self.assertStopped()
+
+    def owner_exits(self, code):
+        """The stream never comes up, because the owner ended with `code` as one does whose recorder left."""
+        def gone(url, seconds, owner, server_pid):
+            owner.kill()
+            owner.wait()
+            owner.returncode = code
+            return False
+        return mock.patch.object(helper, "wait_for_stream", gone)
 
     def test_window_cast_whose_picker_was_dismissed_says_so(self):
-        real = helper.subprocess.Popen
-
-        def popen(cmd, **kw):
-            proc = real(cmd, **kw)
-            if cmd[2:3] != ["live-capture"]:
-                return proc
-            proc.kill()
-            proc.wait()
-            return proc
-        with mock.patch.object(helper.subprocess, "Popen", popen), \
-                mock.patch.object(helper, "wait_for_stream", return_value=False), \
-                self.assertRaises(helper.Problem) as raised:
+        with self.owner_exits(1), self.assertRaises(helper.Problem) as raised:
             self.start(source="window")
         self.assertIn("No window was chosen", str(raised.exception))
         self.assertEqual(self.cleared(), [])
+        self.assertFalse(os.path.exists(self.live_file("live.json")))
 
     def test_capture_that_does_not_start_leaves_the_screens_alone(self):
         with mock.patch.object(helper, "wait_for_stream", return_value=False), self.assertRaises(helper.Problem):
             self.start(screens=("scr_A", "scr_B"))
-        self.assertStopped("/fake/mediamtx", "live-capture")
+        self.assertStopped("live-capture")
         self.assertFalse(os.path.exists(self.live_file("live.json")))
         self.assertEqual(self.cleared(), [])
 
@@ -802,7 +961,7 @@ class LiveCastStart(unittest.TestCase):
             return real_api(method, path, body, **kw)
         with mock.patch.object(helper, "api", flaky), self.assertRaises(RuntimeError):
             self.start(screens=("scr_A", "scr_B", "scr_C"))
-        self.assertStopped("/fake/mediamtx", "live-capture")
+        self.assertStopped("live-capture")
         self.assertFalse(os.path.exists(self.live_file("live.json")))
         self.assertEqual(self.cleared(), ["scr_A"])
 
@@ -828,22 +987,22 @@ class LiveCastStart(unittest.TestCase):
             return real_api(method, path, body, **kw)
         with mock.patch.object(helper, "api", refuse), self.assertRaises(helper.Problem):
             self.start(screens=("scr_A", "scr_B"))
-        self.assertStopped("/fake/mediamtx", "live-capture")
+        self.assertStopped("live-capture")
         self.assertFalse(os.path.exists(self.live_file("live.json")))
         self.assertEqual(self.cleared(), [])
 
-    def test_capture_that_cannot_start_stops_the_server(self):
+    def test_capture_that_cannot_start_leaves_nothing(self):
         self.fail_on["live-capture"] = OSError("no more processes")
         with self.assertRaises(OSError):
             self.start(screens=("scr_A", "scr_B"))
-        self.assertStopped("/fake/mediamtx")
+        self.assertStopped()
         self.assertFalse(os.path.exists(self.live_file("live.json")))
         self.assertEqual(self.cleared(), [])
 
-    def test_unknown_source_stops_the_server(self):
+    def test_unknown_source_starts_nothing(self):
         with self.assertRaises(helper.Problem):
             self.start("nonsense", screens=("scr_A", "scr_B"))
-        self.assertStopped("/fake/mediamtx")
+        self.assertStopped()
         self.assertFalse(os.path.exists(self.live_file("live.json")))
         self.assertEqual(self.cleared(), [])
 
@@ -883,7 +1042,7 @@ class LiveCastStart(unittest.TestCase):
         # Publishing takes the cast's second login, which is not the screens'. The capture process is told
         # it on its pipe, with the server it may send the picture to.
         told = json.loads(self.told[0])
-        self.assertEqual(told["server_pid"], next(proc.pid for cmd, proc in self.children if cmd[0] == "/fake/mediamtx"))
+        self.assertEqual((told["server"], told["config"]), ("/fake/mediamtx", self.live_file("mediamtx.yml")))
         sent = re.fullmatch(r"([0-9a-f]{16}):([0-9a-f]{32})", ":".join(told["login"]))
         self.assertTrue(sent, "publishing takes a random login")
         self.assertNotIn(sent.group(1), (user, password))
@@ -915,7 +1074,7 @@ class LiveCastStart(unittest.TestCase):
         self.start(source="window")
         user, password = self.login(self.playlist_url())
         publisher = json.loads(self.told[0])["login"]
-        self.assertEqual(len(self.children), 3)
+        self.assertEqual(len(self.children), 1)
         for cmd, _ in self.children:
             for secret in (user, password, *publisher):
                 self.assertNotIn(secret, " ".join(cmd))
@@ -923,24 +1082,17 @@ class LiveCastStart(unittest.TestCase):
         self.assertNotIn("-o", capture)  # the capture process gives the recorder its address
         helper.live_stop()
 
-    def test_nothing_is_started_or_sent_when_the_stream_port_is_not_the_casts_server(self):
-        with mock.patch.object(helper, "await_server", side_effect=helper.Problem("held by another program")), \
-                self.assertRaises(helper.Problem):
+    def test_nothing_is_sent_when_the_stream_port_is_not_the_casts_server(self):
+        self.fail_on["server"] = "TCP port 8554 is held by another program, so nothing was cast."
+        with self.assertRaises(helper.Problem) as raised:
             self.start()
-        self.assertStopped("/fake/mediamtx")
-        self.assertEqual((self.told, self.probed, self.calls), ([], [], []))
+        self.assertIn("held by another program", str(raised.exception))
+        self.assertStopped("live-capture")
+        self.assertEqual((self.probed, self.calls), ([], []))
+        self.assertFalse(os.path.exists(self.live_file("live.json")))
 
     def test_recorder_that_hides_its_connections_is_refused_in_words(self):
-        real = helper.subprocess.Popen
-
-        def popen(cmd, **kw):
-            proc = real(cmd, **kw)
-            if cmd[2:3] == ["live-capture"]:
-                proc.poll = lambda: helper.CAPTURE_UNCHECKED
-            return proc
-        with mock.patch.object(helper.subprocess, "Popen", popen), \
-                mock.patch.object(helper, "wait_for_stream", return_value=False), \
-                self.assertRaises(helper.Problem) as raised:
+        with self.owner_exits(helper.CAPTURE_UNCHECKED), self.assertRaises(helper.Problem) as raised:
             self.start(source="window")
         self.assertIn("file capabilities", str(raised.exception))
         self.assertEqual(self.cleared(), [])
@@ -993,7 +1145,7 @@ class LiveCastStart(unittest.TestCase):
         self.unreadable["scr_A"] = 1
         with mock.patch.object(helper, "warn"), self.assertRaises(helper.Problem):
             self.start()
-        self.assertStopped("/fake/mediamtx", "live-capture")
+        self.assertStopped("live-capture")
         self.assertEqual(self.cleared(), ["scr_A"])
         self.assertIsNone(self.takeover_of("scr_A"))
         self.assertFalse(os.path.exists(self.live_file("live.json")))
@@ -1014,7 +1166,7 @@ class LiveCastStart(unittest.TestCase):
         self.lost.add(("POST", "/api/projects/prj_1/playlists"))
         with mock.patch.object(helper, "warn"), self.assertRaises(helper.Problem):
             self.start(screens=("scr_A", "scr_B"))
-        self.assertStopped("/fake/mediamtx", "live-capture")
+        self.assertStopped("live-capture")
         self.assertEqual(self.playlists, {})
         self.assertIn(("DELETE", "/api/playlists/pl_lost", None), self.calls)
         # No screen was asked to take a playlist nobody knew the id of.
@@ -1055,19 +1207,33 @@ class LiveCastStart(unittest.TestCase):
         state.update(lease=True, renewed_at=0)
         helper.write_private(self.live_file("live.json"), json.dumps(state))
 
+    def state(self):
+        with open(self.live_file("live.json")) as f:
+            return json.load(f)
+
+    def ending(self, live=None, **owner):
+        """What the cast's owner decides at one look, for the running cast."""
+        alive = mock.Mock(pid=1, poll=lambda: None)
+        return helper.cast_ending(self.state()["generation"], owner.get("recorder", alive), owner.get("server", alive),
+                                  {"deadline": None, "renewed": time.monotonic()} if live is None else live)
+
     def test_renewal_extends_only_takeovers_that_are_still_the_casts(self):
         self.start(screens=("scr_A", "scr_B"))
         self.screens["scr_B"]["takeover"] = {"playlist_id": "pl_other"}
         self.due_for_renewal()
         self.calls.clear()
         self.headers.clear()
-        with mock.patch.object(helper, "warn"), self.assertRaises(Stop):
-            helper.keep_alive_loop(self.live_file("live.json"), mock.Mock(wait=mock.Mock(side_effect=[False, Stop])))
+        with mock.patch.object(helper, "warn"):
+            self.assertIsNone(self.ending(live={"deadline": None, "renewed": time.monotonic() - helper.LIVE_RENEW_S}))
         posts = [(p, h) for m, p, h in self.headers if m == "POST"]
         self.assertEqual(posts, [("/api/screens/scr_A/takeover", {"If-Match": '"6"'})])
         self.assertEqual(self.takeover_of("scr_B"), "pl_other")
-        with open(self.live_file("live.json")) as f:
-            self.assertEqual(json.load(f)["screens"], ["scr_A"])
+        self.assertEqual(self.state()["screens"], ["scr_A"])
+        # Not due again for an hour.
+        self.calls.clear()
+        self.assertIsNone(self.ending())
+        self.assertEqual(self.calls, [])
+        helper.live_stop()
 
     def test_cast_ends_when_every_screen_shows_something_else(self):
         self.start()
@@ -1075,78 +1241,113 @@ class LiveCastStart(unittest.TestCase):
         self.due_for_renewal()
         self.calls.clear()
         with mock.patch.object(helper, "warn"):
-            ended = helper.keep_alive_loop(self.live_file("live.json"), mock.Mock(wait=mock.Mock(return_value=False)))
-        self.assertEqual(ended, 0)
+            self.assertEqual(self.ending(live={"deadline": None, "renewed": time.monotonic() - helper.LIVE_RENEW_S}), "screens")
         self.assertFalse([c for c in self.calls if c[0] == "POST"])
-        self.assertFalse(os.path.exists(self.live_file("live.json")))
         self.assertEqual(self.takeover_of("scr_A"), "pl_other")
-        self.assertEqual(self.cleared(), [])
+        helper.live_stop()
 
-    # Stop ends the capture first and says why anything else could not be undone.
-
-    def test_keepalive_ends_a_timed_cast_when_its_time_is_up(self):
-        # The panel is not needed for it: a shell that restarted has no timer running.
+    def test_the_owner_ends_a_cast_when_its_time_is_up(self):
         self.start(screens=("scr_A",))
-        with open(self.live_file("live.json")) as f:
-            state = json.load(f)
-        self.assertAlmostEqual(helper.iso_time(state["until"]), time.time() + 30 * 60, delta=5)
-
-        class Stop(Exception):
-            pass
-        with self.assertRaises(Stop):  # not yet
-            helper.keep_alive_loop(self.live_file("live.json"), mock.Mock(wait=mock.Mock(side_effect=[False, Stop])))
-        self.assertTrue(os.path.exists(self.live_file("live.json")))
-        state["until"] = helper.iso_in(-1)
-        helper.write_private(self.live_file("live.json"), json.dumps(state))
-        ended = helper.keep_alive_loop(self.live_file("live.json"), mock.Mock(wait=mock.Mock(return_value=False)))
-        self.assertEqual(ended, 0)
-        self.assertFalse(os.path.exists(self.live_file("live.json")))
-        self.assertEqual(self.cleared(), ["scr_A"])
-        self.assertStopped("/fake/mediamtx", "live-capture", "systemd-inhibit")
-        self.assertIn("time was up", helper.notify.call_args[0][1])
+        self.assertAlmostEqual(helper.iso_time(self.state()["until"]), time.time() + 30 * 60, delta=5)
+        # live_start told the owner how long, and the owner counts it on a clock nobody can set back.
+        self.assertAlmostEqual(json.loads(self.told[1])["seconds"], 30 * 60, delta=5)
+        self.assertIsNone(self.ending(live={"deadline": time.monotonic() + 60, "renewed": time.monotonic()}))
+        with mock.patch.object(helper.time, "time", return_value=0):  # the wall clock is not what counts
+            self.assertEqual(self.ending(live={"deadline": time.monotonic() - 1, "renewed": time.monotonic()}), "time")
         self.assertEqual(helper.iso_time("soon"), 0)
+        helper.live_stop()
 
     def test_a_cast_until_stopped_has_no_time_to_run_out(self):
         helper.live_start("screen:DP-1", ["scr_A"], 0, "Desktop")
-        with open(self.live_file("live.json")) as f:
-            self.assertIsNone(json.load(f)["until"])
+        self.assertIsNone(self.state()["until"])
+        self.assertEqual(json.loads(self.told[1]), {"seconds": 0})
+        self.assertIsNone(self.ending())
+        helper.live_stop()
 
-        class Stop(Exception):
-            pass
-        with self.assertRaises(Stop):
-            helper.keep_alive_loop(self.live_file("live.json"), mock.Mock(wait=mock.Mock(side_effect=[False, Stop])))
-        self.assertTrue(os.path.exists(self.live_file("live.json")))
+    def test_the_owner_ends_a_cast_whose_capture_or_server_is_gone(self):
+        self.start()
+        gone = mock.Mock(pid=1, poll=lambda: 1)
+        self.assertEqual(self.ending(recorder=gone), "capture")
+        self.assertEqual(self.ending(server=gone), "server")
+        helper.live_stop()
+
+    def test_the_owner_ends_a_cast_when_the_stream_port_changes_hands(self):
+        self.start()
+        with mock.patch.object(helper, "port_owner_is", return_value=False):
+            self.assertEqual(self.ending(), "port")
+        # One table that could not be read is not that.
+        with mock.patch.object(helper, "port_owner_is", side_effect=[False, True]) as owner:
+            self.assertIsNone(self.ending())
+        self.assertEqual(owner.call_count, 2)
+        helper.live_stop()
+
+    def test_the_owner_ends_a_cast_whose_state_is_gone_unreadable_or_another_casts(self):
+        # Without its state a cast has no status and no Stop, so it does not go on capturing.
+        self.start()
+        state = self.state()
+        alive = mock.Mock(pid=1, poll=lambda: None)
+        os.remove(self.live_file("live.json"))
+        self.assertEqual(helper.cast_ending(state["generation"], alive, alive, {}), "asked")
+        with open(self.live_file("live.json"), "w") as f:
+            f.write("{not json")
+        self.assertEqual(helper.cast_ending(state["generation"], alive, alive, {}), "asked")
+        helper.write_private(self.live_file("live.json"), json.dumps(dict(state, generation="another")))
+        self.assertEqual(helper.cast_ending(state["generation"], alive, alive, {}), "asked")
+        helper.write_private(self.live_file("live.json"), json.dumps(state))
+        self.assertIsNone(helper.cast_ending(state["generation"], alive, alive, {}))
         helper.live_stop()
 
     def test_a_pid_that_now_names_another_process_is_not_the_casts(self):
         self.start(screens=("scr_A",))
-        with open(self.live_file("live.json")) as f:
-            state = json.load(f)
-        self.assertEqual(sorted(state["born"]), ["keepalive_pid", "recorder_pid", "server_pid"])
+        state = self.state()
+        self.assertEqual(sorted(state["born"]), ["owner_pid", "server_pid"])
         self.assertTrue(all(state["born"].values()))
         self.assertTrue(helper.live_status()["live"])
-        # The recorder's number has gone to another process: same pid, another start time.
-        bystander = next(proc for cmd, proc in self.children if cmd[0] == "live-capture")
-        state["born"]["recorder_pid"] = "1"
-        helper.write_private(self.live_file("live.json"), json.dumps(state))
-        self.assertFalse(helper.live_status()["live"])
+        # The owner's number has gone to another process: same pid, another start time, or none recorded.
+        bystander = self.children[0][1]
+        for born in ("1", None):
+            state["born"]["owner_pid"] = born
+            helper.write_private(self.live_file("live.json"), json.dumps(state))
+            self.assertFalse(helper.live_status()["live"])
         helper.live_stop()
         self.assertIsNone(bystander.poll(), "a process that is not the cast's is not signalled")
         self.assertFalse(os.path.exists(self.live_file("live.json")))
         self.assertEqual(self.cleared(), ["scr_A"])
         self.assertIsNone(helper.process_birth(None))
 
+    def test_a_cast_from_before_start_times_were_recorded_is_stopped_only_if_it_is_what_it_ran(self):
+        # 26.11.3 and earlier wrote three pids and no start times.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        shutil.copy(shutil.which("sleep"), os.path.join(tmp.name, "gpu-screen-recorder"))
+        old_recorder = self.real_popen(["gpu-screen-recorder", "60"], start_new_session=True,
+                                       executable=os.path.join(tmp.name, "gpu-screen-recorder"))
+        bystander = self.real_popen([sys.executable, "-I", "-c", "import time; time.sleep(60)"], start_new_session=True)
+        for proc in (old_recorder, bystander):
+            self.addCleanup(proc.wait)
+            self.addCleanup(proc.kill)
+        legacy = {"recorder_pid": old_recorder.pid, "server_pid": bystander.pid, "keepalive_pid": bystander.pid,
+                  "screens": [], "unsure": []}
+        os.makedirs(helper.LIVE_DIR, exist_ok=True)
+        helper.write_private(self.live_file("live.json"), json.dumps(legacy))
+        self.assertTrue(helper.legacy_process(legacy, "recorder_pid"))
+        self.assertFalse(helper.live_status()["live"])  # the pid recorded for its server runs something else
+        self.assertEqual(helper.live_stop(), "Live cast stopped")
+        self.assertIsNotNone(old_recorder.wait(timeout=5))
+        self.assertIsNone(bystander.poll(), "a reused pid running something else is left alone")
+        self.assertFalse(os.path.exists(self.live_file("live.json")))
+
     def test_a_process_that_has_exited_but_was_not_collected_is_not_running(self):
-        child = subprocess.Popen([sys.executable, "-I", "-c", "import time; time.sleep(60)"])
+        child = self.real_popen([sys.executable, "-I", "-c", "import time; time.sleep(60)"])
         self.addCleanup(child.wait)
         self.addCleanup(child.kill)
         state = {}
-        helper.record_process(state, "recorder_pid", child.pid)
-        self.assertTrue(helper.cast_process(state, "recorder_pid"))
+        helper.record_process(state, "owner_pid", child.pid)
+        self.assertTrue(helper.cast_process(state, "owner_pid"))
         child.kill()
         os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOWAIT)  # exited, and still in the process table
         self.assertTrue(helper.pid_alive(child.pid))
-        self.assertFalse(helper.cast_process(state, "recorder_pid"))
+        self.assertFalse(helper.cast_process(state, "owner_pid"))
 
     def test_a_process_name_with_spaces_and_brackets_does_not_shift_its_start_time(self):
         tmp = tempfile.TemporaryDirectory()
@@ -1155,62 +1356,81 @@ class LiveCastStart(unittest.TestCase):
         with open(odd, "w") as f:
             f.write("#!/bin/sh\nsleep 60\n")
         os.chmod(odd, 0o755)
-        child = subprocess.Popen([odd])
+        child = self.real_popen([odd])
         self.addCleanup(child.wait)
         self.addCleanup(child.kill)
         with open("/proc/%d/stat" % child.pid) as f:
             self.assertEqual(helper.process_birth(child.pid), f.read().split()[-31])
 
     def test_a_new_cast_ends_what_an_earlier_one_left(self):
-        # Its recorder died, so it is not live, but its server still holds the port and its screens the takeover.
+        # Its owner died, so it is not live, but its screens still hold the takeover.
         self.start(screens=("scr_A",))
-        first = list(self.children)
-        capture = next(proc for cmd, proc in first if cmd[0] == "live-capture")
-        capture.kill()
-        capture.wait()
+        first = self.children[0][1]
+        first.kill()
+        first.wait()
         self.assertFalse(helper.live_status()["live"])
         self.start(screens=("scr_B",))
-        for cmd, proc in first:
-            proc.wait(timeout=3)
         self.assertEqual(self.cleared(), ["scr_A"])
         self.assertEqual(helper.live_status()["screens"], ["scr_B"])
         helper.live_stop()
 
-    def test_keepalive_ends_the_cast_when_the_stream_port_changes_hands(self):
+    def test_a_new_cast_stops_one_that_is_still_running(self):
         self.start(screens=("scr_A",))
-        with mock.patch.object(helper, "port_owner_is", return_value=False):
-            ended = helper.keep_alive_loop(self.live_file("live.json"), mock.Mock(wait=mock.Mock(return_value=False)))
-        self.assertEqual(ended, 0)
-        self.assertFalse(os.path.exists(self.live_file("live.json")))
+        first = self.children[0][1]
+        self.start(screens=("scr_B",))
+        self.assertIsNotNone(first.wait(timeout=3))
         self.assertEqual(self.cleared(), ["scr_A"])
-        self.assertIn("Another program", helper.notify.call_args[0][1])
-
-    def test_keepalive_keeps_a_cast_whose_port_table_could_not_be_read_once(self):
-        self.start(screens=("scr_A",))
-
-        class Stop(Exception):
-            pass
-        with mock.patch.object(helper, "port_owner_is", side_effect=[False, True]) as owner, self.assertRaises(Stop):
-            helper.keep_alive_loop(self.live_file("live.json"), mock.Mock(wait=mock.Mock(side_effect=[False, Stop])))
-        self.assertEqual(owner.call_count, 2)
-        self.assertTrue(os.path.exists(self.live_file("live.json")))
+        self.assertEqual(self.takeover_of("scr_B"), "pl_cast")
         helper.live_stop()
 
-    def test_capture_and_server_end_before_the_api_is_asked_anything(self):
+    def test_a_stop_that_started_before_a_new_cast_cannot_clear_the_new_casts_state(self):
+        # Stop read cast A's state; a new cast B then replaced it. Whatever Stop does next is about A.
+        self.start(screens=("scr_A",))
+        first = self.state()
+        self.start(screens=("scr_B",))
+        second = self.state()
+        self.assertNotEqual(first["generation"], second["generation"])
+        self.assertIsNone(helper.take_live(first["generation"]))
+        with self.assertRaises(helper.Problem):
+            helper.save_live(first)
+        self.assertEqual(self.state(), second)
+        self.assertTrue(helper.live_status()["live"])
+        # Two stops at once: one of them gets the cast, the other finds nothing.
+        self.assertEqual(helper.take_live()["generation"], second["generation"])
+        self.assertIsNone(helper.take_live())
+        self.assertEqual(helper.live_stop(), "Nothing is live")
+        helper.claim_live(second)
+        helper.live_stop()
+
+    def test_a_cast_stopped_while_it_starts_places_nothing_more_and_clears_what_it_placed(self):
+        # Stop arrives between the first screen's takeover and the second's.
+        def stop_now():
+            self.on_write.clear()
+            helper.live_stop()
+        self.on_write[("POST", "/api/screens/scr_B/takeover")] = stop_now
+        with self.assertRaises(helper.Problem) as raised:
+            self.start(screens=("scr_A", "scr_B", "scr_C"))
+        self.assertIn("was stopped", str(raised.exception))
+        self.assertStopped("live-capture")
+        self.assertFalse(os.path.exists(self.live_file("live.json")))
+        self.assertEqual([self.takeover_of(s) for s in ("scr_A", "scr_B", "scr_C")], [None, None, None])
+        self.assertEqual(self.playlists, {})
+
+    # Stop ends the capture first and says why anything else could not be undone.
+
+    def test_the_capture_ends_before_the_api_is_asked_anything(self):
         self.start()
         self.calls.clear()
-        real_killpg = helper.os.killpg
+        owner = self.children[0][1]
+        real_api = helper.api
 
-        def killpg(pid, sig):
-            self.calls.append(("KILL", pid, None))
-            return real_killpg(pid, sig)
-        with mock.patch.object(helper.os, "killpg", killpg):
+        def api(method, path, body=None, **kw):
+            self.assertIsNotNone(owner.poll(), "the owner, and with it the capture and the server, has ended")
+            return real_api(method, path, body, **kw)
+        with mock.patch.object(helper, "api", api):
             helper.live_stop()
-        kinds = [m for m, _, _ in self.calls]
-        self.assertEqual(kinds.count("KILL"), 3)
-        self.assertEqual(kinds[:3], ["KILL"] * 3)
-        self.assertNotIn("KILL", kinds[3:])
-        self.assertTrue(kinds[3:])
+        self.assertEqual(owner.returncode, -signal.SIGTERM)
+        self.assertTrue(self.calls)
 
     def test_unexpected_failures_do_not_leave_the_capture_running_or_skip_the_playlist(self):
         self.start(screens=("scr_A", "scr_B"))

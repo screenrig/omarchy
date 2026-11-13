@@ -120,12 +120,15 @@ run `screenrig-omarchy setup` to do that at once.
   the only program listening on the port. It sends the picture and the logins
   only on a connection whose other end is a socket that server holds, checked
   after connecting and before the first byte, so a program that takes the
-  port after the server exits is sent nothing. The keep-alive looks every two
-  seconds and ends the cast if the server is gone or the port has another
-  listener.
+  port after the server exits is sent nothing.
+- **One process owns a cast.** The stream server and the recorder are its
+  children, and the kernel ends them with it however it dies, so neither
+  outlives it. It ends the cast when the time you chose is up (counted on a
+  clock that cannot be set back), when the capture or the server ends, when
+  another program appears on the port, when the cast's state file is gone or
+  another cast's, before sleep, and when you press Stop. Nothing else has to
+  be running for that: not the shell, not the panel.
 
-- **Time.** A timed cast is ended by its own keep-alive process when the time
-  is up, so it ends on time when the shell or the panel is not running.
 
 Another account on the same machine can still make a cast fail, by holding
 port 8554 first; it cannot publish to the cast or read it. A

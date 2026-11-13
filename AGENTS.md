@@ -23,7 +23,12 @@ Rules:
 - The agent's brief (`AGENT_BRIEF`) is constant: nothing from the project or
   the API goes into an instruction file. The `ask` IPC call writes a draft;
   the person sends it.
-- A stored pid is a process only with its start time (`cast_process`).
+- A cast lives in one process, `live-capture`: it starts mediamtx and the
+  recorder as children that die with it, and it alone decides when the cast
+  ends (`cast_ending`). Change `live.json` only through `claim_live`,
+  `save_live` and `take_live`, which lock it and check the cast's
+  `generation`. A stored pid is a process only with its start time
+  (`cast_process`).
 - Nothing goes to TCP 8554 except through `server_connection`, which checks
   that the connection's other end is the cast's own mediamtx.
 - Gate: `python3 -m unittest discover -s tests` and `omarchy plugin validate .`.
