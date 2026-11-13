@@ -1220,6 +1220,7 @@ LIVE_NOTICE = "Live cast"
 # vanishes the lease runs out and the screens return to their own content.
 LIVE_LEASE_MIN = 75
 LIVE_RENEW_S = 3600
+LIVE_PLACE_S = 180  # the playlist and every takeover are placed within this long of the stream coming up
 # How often a cast's owner looks at it. Screens hold the stream's address and login, so a cast whose
 # port another program has taken is ended within this long.
 LIVE_CHECK_S = 2
@@ -1985,14 +1986,22 @@ def live_capture(recorder_args):
         children.append((sleep_monitor, signal.SIGTERM))
     except OSError:
         sleep_monitor = None
-    live = {}
+    # Until screens show the cast it has a time by which the next word from live_start must come.
+    live = {"start_by": time.monotonic() + float(told["startup"])}
 
     def hear_live_start():
         try:
-            seconds = float(json.loads(sys.stdin.readline())["seconds"])
+            # The stream is up. From now the cast's own time runs, whatever the rest of the start does.
+            word = json.loads(sys.stdin.readline())
+            seconds = float(word["seconds"])
+            live.update(deadline=time.monotonic() + seconds if seconds > 0 else None,
+                        start_by=time.monotonic() + float(word["placing"]))
+            # Screens show it.
+            if json.loads(sys.stdin.readline())["live"] is not True:
+                raise ValueError("not live")
         except (OSError, ValueError, KeyError, TypeError):
             return end("abandoned")  # live_start is gone, or failed before a screen showed the cast
-        live.update(deadline=time.monotonic() + seconds if seconds > 0 else None)
+        live.update(on=True, start_by=None)
         if seconds <= 0:
             keep_lease(generation, ended, end)
 
@@ -2008,7 +2017,8 @@ def live_capture(recorder_args):
         threading.Thread(target=watch_sleep, daemon=True).start()
     try:
         # Nothing in this loop waits on the network: the takeovers' lease is renewed on another thread.
-        while not ended.wait(timeout=min(LIVE_CHECK_S, max(0.05, (live.get("deadline") or 1e9) - time.monotonic()))):
+        while not ended.wait(timeout=min(LIVE_CHECK_S, max(0.05, min(live.get("deadline") or 1e9, live.get("start_by") or 1e9)
+                                                         - time.monotonic()))):
             reason = cast_ending(generation, recorder, server, live)
             if reason:
                 end(reason)
@@ -2021,7 +2031,7 @@ def live_capture(recorder_args):
     state = take_live(generation)
     if state is not None:
         finish_cast(state)
-        if live and why_ended[0] in OWNER_ENDINGS:
+        if live.get("on") and why_ended[0] in OWNER_ENDINGS:
             notify(*OWNER_ENDINGS[why_ended[0]])
     if unchecked.is_set():
         return CAPTURE_UNCHECKED
@@ -2029,7 +2039,8 @@ def live_capture(recorder_args):
 
 
 def cast_ending(generation, recorder, server, live):
-    """Why the cast must end now, or None. `live` is empty until screens show the cast."""
+    """Why the cast must end now, or None. `live` holds the cast's deadlines on the monotonic clock: `start_by`
+    while it starts, `deadline` for a timed cast once its stream is up."""
     if recorder.poll() is not None:
         return "capture"
     if server.poll() is not None:
@@ -2038,6 +2049,8 @@ def cast_ending(generation, recorder, server, live):
         return "port"  # the screens hold the stream's address and login: they must not reach another program
     if live.get("deadline") and time.monotonic() >= live["deadline"]:
         return "time"
+    if live.get("start_by") and time.monotonic() >= live["start_by"]:
+        return "abandoned"  # the start stalled: a cast nobody finished starting does not go on capturing
     state = read_live()
     if state is None or state.get("generation") != generation:
         return "asked"  # stopped or replaced: without its state a cast has no Stop, so it does not go on
@@ -2157,6 +2170,7 @@ def live_start(source, screens, minutes, label):
             # Media3 rejects the empty `s= ` mediamtx writes for RTMP sources.
             "-c", "rtsp", "-ffmpeg-opts", "rtsp_transport=tcp"],
             {"generation": state["generation"], "login": list(publisher), "server": mediamtx_binary(),
+             "startup": (PICK_WAIT_S if source == "window" else 20) + 30,
              "config": mediamtx_config(user, password, publisher), "server_log": os.path.join(logs, "mediamtx.log")},
             open(os.path.join(logs, "recorder.log"), "w"))
         record_process(state, "owner_pid", owner.pid)
@@ -2176,8 +2190,12 @@ def live_start(source, screens, minutes, label):
             if source == "window" and owner.poll() is not None:
                 raise Problem("No window was chosen, so nothing was cast.")
             raise Problem("The capture did not start; see %s" % os.path.join(logs, "recorder.log"))
-        playlist = state["playlist_id"] = live_playlist(state["url"], state)
         until = iso_in(minutes) if minutes > 0 else iso_in(LIVE_LEASE_MIN)
+        # The owner counts the cast's time itself from here, before any screen is asked: a start that then
+        # stalls cannot stretch it, and one that is not finished in time ends.
+        owner.stdin.write(json.dumps({"seconds": minutes * 60 if minutes > 0 else 0, "placing": LIVE_PLACE_S}) + "\n")
+        owner.stdin.flush()
+        playlist = state["playlist_id"] = live_playlist(state["url"], state)
         shown, failed = state["screens"], []
         for sid in screens:
             # Recorded before the request: a takeover whose answer is lost is still ended when the cast stops.
@@ -2201,9 +2219,8 @@ def live_start(source, screens, minutes, label):
         # `until` is the cast's own end (none until stopped); the lease is the takeover's.
         state.update(until=until if minutes > 0 else None, lease=minutes <= 0, renewed_at=time.time())
         save_live(state)
-        # The owner counts the cast's time itself from here, and ends the cast if this word never reaches it.
         with owner.stdin as pipe:
-            pipe.write(json.dumps({"seconds": max(1, iso_time(until) - time.time()) if minutes > 0 else 0}) + "\n")
+            pipe.write(json.dumps({"live": True}) + "\n")
         remember_cast(source=source, label=label, screens=shown, minutes=str(minutes))
         # Stays up until the cast ends, so Stop is always one click away.
         ends = time.strftime(" · until %-I:%M %p", time.localtime(time.time() + minutes * 60)) if minutes > 0 else ""
@@ -2231,13 +2248,38 @@ def live_start(source, screens, minutes, label):
 def legacy_process(state, key):
     """Whether a pid from a cast that a version before 26.11.4 started is still that cast's process. Those
     casts recorded no start time, so the process is known by what it runs."""
-    marks = {"recorder_pid": "gpu-screen-recorder", "server_pid": os.path.join(LIVE_BIN, "mediamtx"),
-             "keepalive_pid": "live-keepalive"}
     try:
         with open("/proc/%d/cmdline" % int(state.get(key) or 0), "rb") as f:
-            return marks[key].encode() in f.read().split(b"\0")
+            args = [os.fsdecode(arg) for arg in f.read().split(b"\0")[:-1]]
     except (OSError, ValueError):
         return False
+    if not args:
+        return False
+    if key == "recorder_pid":
+        # Publishing to the plugin's own stream path is what only a cast's recorder does.
+        return (os.path.basename(args[0]) == "gpu-screen-recorder"
+                and re.fullmatch(r"rtsp://(\S+@)?127\.0\.0\.1:%d/live" % LIVE_PORT, args[-1]) is not None)
+    if key == "server_pid":
+        return args == [os.path.join(LIVE_BIN, "mediamtx"), os.path.join(LIVE_DIR, "mediamtx.yml")]
+    return key == "keepalive_pid" and args[-2:] == [os.path.realpath(__file__), "live-keepalive"]
+
+
+def signal_process(pid, is_it, sig):
+    """Send `sig` to process `pid` if `is_it()` says it is the one meant. The check is made with a handle
+    on the process already held, and the signal goes through that handle, so it cannot reach another
+    process given the number in between. Returns the handle (to wait on, then close) or None."""
+    try:
+        handle = os.pidfd_open(int(pid or 0))
+    except (OSError, ValueError, TypeError):
+        return None  # gone
+    try:
+        if is_it():
+            signal.pidfd_send_signal(handle, sig)
+            return handle
+    except OSError as err:
+        warn("could not signal process %s: %s" % (pid, why(err)))
+    os.close(handle)
+    return None
 
 
 def stop_processes(state):
@@ -2245,22 +2287,14 @@ def stop_processes(state):
     them with it otherwise."""
     if "generation" not in state:
         for key, sig in (("keepalive_pid", signal.SIGTERM), ("recorder_pid", signal.SIGINT), ("server_pid", signal.SIGTERM)):
-            try:
-                if legacy_process(state, key):
-                    os.killpg(int(state[key]), sig)
-            except OSError as err:
-                warn("could not end %s: %s" % (key, why(err)))
+            handle = signal_process(state.get(key), lambda: legacy_process(state, key), sig)
+            if handle is not None:
+                os.close(handle)
+        return
+    owner = signal_process(state.get("owner_pid"), lambda: cast_process(state, "owner_pid"), signal.SIGTERM)
+    if owner is None:
         return
     try:
-        # A handle on the process itself: once it is shown to be the cast's owner, the signals go to that
-        # process and to no other that might be given its number.
-        owner = os.pidfd_open(int(state.get("owner_pid") or 0))
-    except (OSError, ValueError):
-        return  # gone
-    try:
-        if not cast_process(state, "owner_pid"):
-            return
-        signal.pidfd_send_signal(owner, signal.SIGTERM)
         if not select.select([owner], [], [], 8)[0]:
             signal.pidfd_send_signal(owner, signal.SIGKILL)  # its children die with it
             select.select([owner], [], [], 2)

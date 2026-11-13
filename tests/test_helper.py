@@ -654,6 +654,7 @@ with open(os.environ["TRIAL"] + "/notices", "a") as f:
         os.makedirs(self.live)
         self.write_state("g1")
         self.pids = []
+        self.startup = 60
         self.addCleanup(self.reap)
 
     def reap(self):
@@ -684,6 +685,7 @@ with open(os.environ["TRIAL"] + "/notices", "a") as f:
         self.addCleanup(lambda: proc.stdin.closed or proc.stdin.close())
         self.pids.append(proc.pid)
         proc.stdin.write(json.dumps({"generation": "g1", "login": list(self.LOGIN), "status_fd": status_fd,
+                                     "startup": self.startup,
                                      "server": os.path.join(self.root, "bin", "server"), "config": self.config,
                                      "server_log": os.path.join(self.root, "server.log")}) + "\n")
         proc.stdin.flush()
@@ -716,6 +718,10 @@ with open(os.environ["TRIAL"] + "/notices", "a") as f:
         self.pids.append(recorder_pid)
         return proc, [answer["server_pid"], recorder_pid]
 
+    def go_live(self, proc, seconds):
+        proc.stdin.write(json.dumps({"seconds": seconds, "placing": 60}) + "\n" + json.dumps({"live": True}) + "\n")
+        proc.stdin.close()
+
     def assertGone(self, pids):
         self.assertTrue(self.until(lambda: all(helper.process_birth(pid) is None for pid in pids), 8),
                         "the stream server and the recorder end with the owner")
@@ -737,8 +743,7 @@ with open(os.environ["TRIAL"] + "/notices", "a") as f:
 
     def test_a_timed_cast_ends_when_its_time_is_up_with_nothing_else_running(self):
         proc, children = self.publishing()
-        proc.stdin.write(json.dumps({"seconds": 1}) + "\n")
-        proc.stdin.close()
+        self.go_live(proc, 1)
         self.assertEqual(proc.wait(timeout=10), 0)
         self.assertGone(children)
         self.assertFalse(os.path.exists(os.path.join(self.live, "live.json")), "the owner cleared its own state")
@@ -753,10 +758,32 @@ with open(os.environ["TRIAL"] + "/notices", "a") as f:
         self.assertGone(children)
         self.assertNotIn(b"omarchy-notification-send", self.read("notices"))
 
+    def test_a_start_that_stalls_does_not_keep_the_capture_running(self):
+        # live_start is alive and silent: waiting for a window that is never chosen, or for a screen's answer.
+        self.startup = 1
+        proc, children = self.publishing()
+        self.assertEqual(proc.wait(timeout=10), 1)
+        self.assertGone(children)
+        self.assertFalse(proc.stdin.closed)
+
+    def test_a_timed_casts_time_runs_from_the_stream_coming_up_even_if_the_start_never_finishes(self):
+        proc, children = self.publishing()
+        proc.stdin.write(json.dumps({"seconds": 1, "placing": 60}) + "\n")
+        proc.stdin.flush()
+        self.assertEqual(proc.wait(timeout=10), 0)
+        self.assertGone(children)
+        self.assertNotIn(b"omarchy-notification-send", self.read("notices"))
+
+    def test_a_start_whose_screens_are_not_placed_in_time_ends(self):
+        proc, children = self.publishing()
+        proc.stdin.write(json.dumps({"seconds": 0, "placing": 1}) + "\n")
+        proc.stdin.flush()
+        self.assertEqual(proc.wait(timeout=10), 1)
+        self.assertGone(children)
+
     def test_the_server_and_the_recorder_die_with_an_owner_that_is_killed(self):
         proc, children = self.publishing()
-        proc.stdin.write(json.dumps({"seconds": 0}) + "\n")
-        proc.stdin.close()
+        self.go_live(proc, 0)
         proc.kill()
         proc.wait()
         self.assertGone(children)
@@ -768,8 +795,7 @@ with open(os.environ["TRIAL"] + "/notices", "a") as f:
                 if os.path.exists(os.path.join(self.root, name)):
                     os.remove(os.path.join(self.root, name))
             proc, children = self.publishing()
-            proc.stdin.write(json.dumps({"seconds": 0}) + "\n")
-            proc.stdin.close()
+            self.go_live(proc, 0)
             change()
             self.assertEqual(proc.wait(timeout=10), 0)
             self.assertGone(children)
@@ -1289,8 +1315,13 @@ class LiveCastStart(unittest.TestCase):
     def test_the_owner_ends_a_cast_when_its_time_is_up(self):
         self.start(screens=("scr_A",))
         self.assertAlmostEqual(helper.iso_time(self.state()["until"]), time.time() + 30 * 60, delta=5)
-        # live_start told the owner how long, and the owner counts it on a clock nobody can set back.
-        self.assertAlmostEqual(json.loads(self.told[1])["seconds"], 30 * 60, delta=5)
+        # live_start told the owner how long as a plain duration, before it asked any screen, and the owner
+        # counts it on a clock nobody can set back.
+        self.assertEqual([json.loads(line) for line in self.told[1:]],
+                         [{"seconds": 30 * 60, "placing": helper.LIVE_PLACE_S}, {"live": True}])
+        self.assertEqual(json.loads(self.told[0])["startup"], 50)
+        self.assertIsNone(self.ending(live={"start_by": time.monotonic() + 60}))
+        self.assertEqual(self.ending(live={"start_by": time.monotonic() - 1}), "abandoned")
         self.assertIsNone(self.ending(live={"deadline": time.monotonic() + 60}))
         with mock.patch.object(helper.time, "time", return_value=0):  # the wall clock is not what counts
             self.assertEqual(self.ending(live={"deadline": time.monotonic() - 1}), "time")
@@ -1300,7 +1331,7 @@ class LiveCastStart(unittest.TestCase):
     def test_a_cast_until_stopped_has_no_time_to_run_out(self):
         helper.live_start("screen:DP-1", ["scr_A"], 0, "Desktop")
         self.assertIsNone(self.state()["until"])
-        self.assertEqual(json.loads(self.told[1]), {"seconds": 0})
+        self.assertEqual(json.loads(self.told[1]), {"seconds": 0, "placing": helper.LIVE_PLACE_S})
         self.assertIsNone(self.ending())
         helper.live_stop()
 
@@ -1359,10 +1390,18 @@ class LiveCastStart(unittest.TestCase):
         # 26.11.3 and earlier wrote three pids and no start times.
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        shutil.copy(shutil.which("sleep"), os.path.join(tmp.name, "gpu-screen-recorder"))
-        old_recorder = self.real_popen(["gpu-screen-recorder", "60"], start_new_session=True,
-                                       executable=os.path.join(tmp.name, "gpu-screen-recorder"))
-        bystander = self.real_popen([sys.executable, "-I", "-c", "import time; time.sleep(60)"], start_new_session=True)
+        shutil.copy(shutil.which("tail"), os.path.join(tmp.name, "gpu-screen-recorder"))
+        # As 26.11.3 ran it: the recorder publishing to the plugin's own stream path.
+        old_recorder = self.real_popen(["gpu-screen-recorder", "-f", "/dev/null", "rtsp://u:p@127.0.0.1:8554/live"],
+                                       executable=os.path.join(tmp.name, "gpu-screen-recorder"),
+                                       stderr=subprocess.DEVNULL, start_new_session=True)
+        # Processes that only mention it, as another recording or any program might.
+        bystander = self.real_popen([sys.executable, "-I", "-c", "import time; time.sleep(60)", "gpu-screen-recorder"],
+                                    start_new_session=True)
+        recording = self.real_popen(["gpu-screen-recorder", "-f", "/dev/null"], stderr=subprocess.DEVNULL,
+                                    executable=os.path.join(tmp.name, "gpu-screen-recorder"), start_new_session=True)
+        self.addCleanup(recording.wait)
+        self.addCleanup(recording.kill)
         for proc in (old_recorder, bystander):
             self.addCleanup(proc.wait)
             self.addCleanup(proc.kill)
@@ -1371,6 +1410,10 @@ class LiveCastStart(unittest.TestCase):
         os.makedirs(helper.LIVE_DIR, exist_ok=True)
         helper.write_private(self.live_file("live.json"), json.dumps(legacy))
         self.assertTrue(helper.legacy_process(legacy, "recorder_pid"))
+        for pid in (bystander.pid, recording.pid):
+            self.assertFalse(helper.legacy_process(dict(legacy, recorder_pid=pid), "recorder_pid"))
+            helper.stop_processes(dict(legacy, recorder_pid=pid))
+        self.assertEqual((bystander.poll(), recording.poll()), (None, None))
         self.assertFalse(helper.live_status()["live"])  # the pid recorded for its server runs something else
         self.assertEqual(helper.live_stop(), "Live cast stopped")
         self.assertIsNotNone(old_recorder.wait(timeout=5))
@@ -1440,6 +1483,16 @@ class LiveCastStart(unittest.TestCase):
         self.assertIsNone(helper.take_live())
         self.assertEqual(helper.live_stop(), "Nothing is live")
         helper.claim_live(second)
+        helper.live_stop()
+
+    def test_the_owner_has_the_casts_time_before_any_screen_is_asked(self):
+        # A wall clock set back an hour while the screens are asked does not stretch the cast.
+        seen = []
+        self.on_write[("POST", "/api/screens/scr_A/takeover")] = lambda: seen.append(list(self.told))
+        with mock.patch.object(helper, "iso_time", side_effect=AssertionError("the wall clock is not asked")):
+            self.start()
+        self.assertEqual(json.loads(seen[0][1])["seconds"], 30 * 60)
+        self.assertEqual(len(seen[0]), 2, "not yet told it is live")
         helper.live_stop()
 
     def test_a_cast_stopped_while_it_starts_places_nothing_more_and_clears_what_it_placed(self):
