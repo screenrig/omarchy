@@ -7,10 +7,13 @@ import io
 import json
 import os
 import re
+import socket
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 import urllib.error
 from unittest import mock
@@ -237,6 +240,330 @@ class LiveCast(unittest.TestCase):
         self.assertTrue(png.startswith(b"\x89PNG\r\n\x1a\n") and png.endswith(b"IEND\xaeB`\x82"))
 
 
+class CaptureGate(unittest.TestCase):
+    """The loopback port the recorder publishes to, with real sockets and processes."""
+
+    LOGIN = base64.b64encode(b"pub:secret")
+
+    def listener(self):
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        sock.listen(8)
+        self.addCleanup(sock.close)
+        return sock, sock.getsockname()[1]
+
+    def child(self, code, *args):
+        """A Python child that prints one line when it is ready and then waits to be killed."""
+        proc = subprocess.Popen([sys.executable, "-I", "-c", code + "\nimport time\nprint('ready', flush=True)\ntime.sleep(60)"]
+                                + [str(a) for a in args], stdout=subprocess.PIPE, text=True)
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        self.assertEqual(proc.stdout.readline().strip(), "ready")
+        self.addCleanup(proc.stdout.close)
+        return proc
+
+    def accepted(self, sock):
+        conn, _ = sock.accept()
+        self.addCleanup(conn.close)
+        return conn
+
+    CONNECT = "import socket, sys\ns = socket.create_connection(('127.0.0.1', int(sys.argv[1])))"
+    LISTEN = ("import socket, sys\ns = socket.socket()\ns.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)\n"
+              "s.bind((sys.argv[2], int(sys.argv[1])))\ns.listen(1)")
+
+    def test_only_the_named_process_s_own_socket_is_the_peer(self):
+        gate, port = self.listener()
+        mine = socket.create_connection(("127.0.0.1", port))
+        self.addCleanup(mine.close)
+        conn = self.accepted(gate)
+        self.assertTrue(helper.peer_is(conn, os.getpid()))
+        stranger = self.child(self.CONNECT, port)
+        theirs = self.accepted(gate)
+        self.assertFalse(helper.peer_is(theirs, os.getpid()))
+        self.assertTrue(helper.peer_is(theirs, stranger.pid))
+        self.assertFalse(helper.peer_is(conn, stranger.pid))
+
+    def reset(self, sock):
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        sock.close()
+
+    def test_a_connection_that_was_reset_is_nobody_s(self):
+        gate, port = self.listener()
+        mine = socket.create_connection(("127.0.0.1", port))
+        conn = self.accepted(gate)
+        self.reset(mine)
+        self.assertFalse(helper.peer_is(conn, os.getpid()))
+
+    def test_a_connection_reset_while_it_is_checked_is_nobody_s(self):
+        # Its addresses are free from then on, and here another socket of the process has them by the time
+        # the table is read: the table describes that socket, not the connection in hand.
+        gate, port = self.listener()
+        mine = socket.create_connection(("127.0.0.1", port))
+        conn = self.accepted(gate)
+        other = socket.socket()
+        self.addCleanup(other.close)
+        inode = re.fullmatch(r"socket:\[(\d+)\]", os.readlink("/proc/self/fd/%d" % other.fileno())).group(1)
+        rows = [(local, remote, state, inode) for local, remote, state, _ in helper.tcp_rows()
+                if local.endswith(":%04X" % mine.getsockname()[1]) and remote.endswith(":%04X" % port)]
+        self.assertEqual(len(rows), 1)
+
+        def table():
+            self.reset(mine)
+            return rows
+        with mock.patch.object(helper, "tcp_rows", table):
+            self.assertFalse(helper.peer_is(conn, os.getpid()))
+        # The same table for a connection that is still up is accepted, so it is the reset that decides.
+        again = socket.create_connection(("127.0.0.1", port))
+        self.addCleanup(again.close)
+        live = self.accepted(gate)
+        rows[0] = ("0100007F:%04X" % again.getsockname()[1],) + rows[0][1:]
+        with mock.patch.object(helper, "tcp_rows", lambda: rows):
+            self.assertTrue(helper.peer_is(live, os.getpid()))
+
+    def test_a_peer_that_has_sent_its_last_byte_is_still_the_peer(self):
+        gate, port = self.listener()
+        mine = socket.create_connection(("127.0.0.1", port))
+        self.addCleanup(mine.close)
+        mine.shutdown(socket.SHUT_WR)
+        self.assertTrue(helper.peer_is(self.accepted(gate), os.getpid()))
+
+    def test_a_process_that_is_gone_or_hides_its_files_holds_no_socket(self):
+        gone = subprocess.Popen([sys.executable, "-I", "-c", "pass"])
+        gone.wait()
+        self.assertEqual(helper.process_sockets(gone.pid), set())
+        self.assertFalse(helper.sockets_hidden(gone.pid))
+        self.assertEqual(helper.process_sockets(1), set())  # init is not this user's
+        self.assertEqual(helper.sockets_hidden(1), os.geteuid() != 0)
+        self.assertFalse(helper.sockets_hidden(os.getpid()))
+
+    def test_a_port_is_the_server_s_only_when_nobody_else_listens_on_it(self):
+        mine, port = self.listener()
+        self.assertTrue(helper.port_owner_is(os.getpid(), port))
+        self.assertFalse(helper.port_owner_is(None, port))
+        other = self.child(self.LISTEN, 0, "127.0.0.1")
+        self.assertFalse(helper.port_owner_is(other.pid, port))
+        free = socket.socket()
+        free.bind(("127.0.0.1", 0))
+        unused = free.getsockname()[1]
+        free.close()
+        self.assertFalse(helper.port_owner_is(os.getpid(), unused))
+
+    def test_a_second_listener_on_the_port_disowns_it(self):
+        # What a program does to take connections meant for the stream server: a more specific bind.
+        wide = socket.socket(socket.AF_INET6)
+        wide.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        wide.bind(("::", 0))
+        wide.listen(1)
+        self.addCleanup(wide.close)
+        port = wide.getsockname()[1]
+        self.assertTrue(helper.port_owner_is(os.getpid(), port))
+        beside = self.child(self.LISTEN, port, "127.0.0.1")
+        self.assertFalse(helper.port_owner_is(os.getpid(), port))
+        self.assertFalse(helper.port_owner_is(beside.pid, port))
+
+    def relay(self, sent):
+        """What the relay passes on for `sent` (add_login, then the plain copy that follows RECORD), and
+        whether it reached RECORD."""
+        client, inner = socket.socketpair()
+        outer, server = socket.socketpair()
+        for sock in (client, inner, outer, server):
+            self.addCleanup(sock.close)
+        def send():
+            for part in sent:
+                client.sendall(part)
+            client.shutdown(socket.SHUT_WR)
+        sender = threading.Thread(target=send, daemon=True)
+        sender.start()
+        try:
+            reached = helper.add_login(inner, outer, self.LOGIN)
+            if reached:
+                helper.pump(inner, outer)
+        finally:
+            inner.close()  # unblocks a sender whose request was refused part-way
+            sender.join(5)
+            outer.close()
+        got = b""
+        while True:
+            data = server.recv(65536)
+            if not data:
+                return got, reached
+            got += data
+
+    def test_each_request_up_to_record_gets_the_login(self):
+        sdp = b"v=0\r\ns=No Name\r\n\r\nm=video 0 RTP/AVP 96\r\n"
+        auth = b"Authorization: Basic " + self.LOGIN + b"\r\n"
+        requests = [
+            b"OPTIONS rtsp://127.0.0.1:1/live RTSP/1.0\r\nCSeq: 1\r\n\r\n",
+            b"ANNOUNCE rtsp://127.0.0.1:1/live RTSP/1.0\r\nCSeq: 2\r\ncontent-LENGTH : %d\r\n\r\n" % len(sdp) + sdp,
+            b"SETUP rtsp://127.0.0.1:1/live/streamid=0 RTSP/1.0\r\nCSeq: 3\r\nAuthorization: Basic bm90Om91cnM=\r\n\r\n",
+            b"RECORD rtsp://127.0.0.1:1/live RTSP/1.0\r\nCSeq: 4\r\n\r\n",
+        ]
+        stream = b"$\x00\x00\x04abcd" + b"OPTIONS not a request RTSP/1.0\r\n\r\n"
+        blob = b"".join(requests) + stream
+        # Whole, and a byte at a time: a request may arrive in any number of pieces.
+        for sent in ([blob], [blob[i:i + 1] for i in range(len(blob))]):
+            got, reached = self.relay(sent)
+            self.assertTrue(reached)
+            self.assertEqual(got, (
+                b"OPTIONS rtsp://127.0.0.1:1/live RTSP/1.0\r\n" + auth + b"CSeq: 1\r\n\r\n"
+                + b"ANNOUNCE rtsp://127.0.0.1:1/live RTSP/1.0\r\n" + auth
+                + b"CSeq: 2\r\ncontent-LENGTH : %d\r\n\r\n" % len(sdp) + sdp
+                # A login the recorder sent is dropped: only the cast's own goes to the server.
+                + b"SETUP rtsp://127.0.0.1:1/live/streamid=0 RTSP/1.0\r\n" + auth + b"CSeq: 3\r\n\r\n"
+                + b"RECORD rtsp://127.0.0.1:1/live RTSP/1.0\r\n" + auth + b"CSeq: 4\r\n\r\n"
+                # After RECORD the bytes are the stream, passed on as they are.
+                + stream))
+
+    def test_a_request_cut_short_or_out_of_bounds_ends_the_relay(self):
+        got, reached = self.relay([b"ANNOUNCE rtsp://x/live RTSP/1.0\r\nContent-Length: 10\r\n\r\nabc"])
+        self.assertEqual((got, reached), (b"", False))
+        for bad in (b"ANNOUNCE rtsp://x/live RTSP/1.0\r\nContent-Length: -1\r\n\r\n",
+                    b"ANNOUNCE rtsp://x/live RTSP/1.0\r\nContent-Length: %d\r\n\r\n" % (helper.GATE_BODY_MAX + 1),
+                    b"OPTIONS rtsp://x/live RTSP/1.0\r\nX: " + b"a" * helper.GATE_HEAD_MAX):
+            with self.assertRaises(OSError):
+                self.relay([bad])
+
+    def gate(self, recorder_pid, server_pid):
+        gate, port = self.listener()
+        ended, unchecked = threading.Event(), threading.Event()
+        thread = threading.Thread(target=helper.serve_gate, daemon=True,
+                                  args=(gate, recorder_pid, server_pid, self.LOGIN, ended.set, unchecked))
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(gate.close)
+        return port, ended, unchecked
+
+    def closed_unread(self, sock):
+        sock.settimeout(5)
+        try:
+            return sock.recv(1) == b""
+        except ConnectionResetError:
+            return True
+
+    def test_the_gate_relays_the_recorder_s_connection_and_no_other(self):
+        server, live_port = self.listener()
+        with mock.patch.object(helper, "LIVE_PORT", live_port), mock.patch.object(helper, "warn") as warned:
+            port, ended, _ = self.gate(os.getpid(), os.getpid())
+            # A stranger first, as while the window chooser waits: closed, and nothing reaches the server.
+            self.child(self.CONNECT + "\ns.sendall(b'ANNOUNCE rtsp://x/live RTSP/1.0\\r\\n\\r\\n')", port)
+            server.settimeout(0.5)
+            with self.assertRaises(socket.timeout):
+                server.accept()
+            self.assertIn("not the recorder's", warned.call_args[0][0])
+            self.assertFalse(ended.is_set())
+            # Then the recorder: relayed, with the login.
+            server.settimeout(5)
+            recorder = socket.create_connection(("127.0.0.1", port))
+            self.addCleanup(recorder.close)
+            recorder.sendall(b"OPTIONS rtsp://x/live RTSP/1.0\r\nCSeq: 1\r\n\r\n")
+            upstream = self.accepted(server)
+            upstream.settimeout(5)
+            self.assertEqual(upstream.recv(4096), b"OPTIONS rtsp://x/live RTSP/1.0\r\nAuthorization: Basic "
+                             + self.LOGIN + b"\r\nCSeq: 1\r\n\r\n")
+            upstream.sendall(b"RTSP/1.0 200 OK\r\nCSeq: 1\r\n\r\n")
+            recorder.settimeout(5)
+            self.assertEqual(recorder.recv(4096), b"RTSP/1.0 200 OK\r\nCSeq: 1\r\n\r\n")
+            # The port closed once the recorder was in: the login is used for one connection.
+            with self.assertRaises(ConnectionRefusedError):
+                socket.create_connection(("127.0.0.1", port), timeout=5)
+            recorder.close()
+            self.assertTrue(ended.wait(5), "the capture ends with the recorder's connection")
+
+    def test_the_gate_sends_nothing_to_a_port_that_is_not_the_cast_s_server(self):
+        server, live_port = self.listener()
+        other = self.child("pass")
+        with mock.patch.object(helper, "LIVE_PORT", live_port), mock.patch.object(helper, "warn") as warned:
+            port, ended, _ = self.gate(os.getpid(), other.pid)
+            recorder = socket.create_connection(("127.0.0.1", port))
+            self.addCleanup(recorder.close)
+            recorder.sendall(b"OPTIONS rtsp://x/live RTSP/1.0\r\nCSeq: 1\r\n\r\n")
+            self.assertTrue(ended.wait(5))
+            self.assertTrue(self.closed_unread(recorder))
+            server.settimeout(0.5)
+            with self.assertRaises(socket.timeout):
+                server.accept()
+            self.assertIn("not the cast's stream server", warned.call_args[0][0])
+
+    def test_the_gate_lets_nobody_in_when_the_recorder_hides_its_sockets(self):
+        with mock.patch.object(helper, "sockets_hidden", return_value=True), mock.patch.object(helper, "warn"):
+            port, ended, unchecked = self.gate(1, os.getpid())
+            sock = socket.create_connection(("127.0.0.1", port))
+            self.addCleanup(sock.close)
+            self.assertTrue(ended.wait(5))
+            self.assertTrue(unchecked.is_set())
+            self.assertTrue(self.closed_unread(sock))
+
+    def test_await_server_refuses_a_port_someone_else_holds(self):
+        mine, port = self.listener()
+        other = self.child("pass")
+        gone = subprocess.Popen([sys.executable, "-I", "-c", "pass"])
+        gone.wait()
+        with mock.patch.object(helper, "LIVE_PORT", port):
+            helper.await_server(mock.Mock(pid=os.getpid(), poll=lambda: None), "log")
+            with self.assertRaises(helper.Problem) as raised:
+                helper.await_server(gone, "the log")
+            self.assertIn("the log", str(raised.exception))
+            clock = iter(range(0, 1000, 3))
+            with mock.patch.object(helper.time, "sleep"), mock.patch.object(helper.time, "time", lambda: next(clock)), \
+                    self.assertRaises(helper.Problem) as raised:
+                helper.await_server(mock.Mock(pid=other.pid, poll=lambda: None), "log")
+            self.assertIn("held by another program", str(raised.exception))
+
+    def test_stream_wait_stops_probing_when_the_port_changes_hands(self):
+        with mock.patch.object(helper, "port_owner_is", return_value=False), \
+                mock.patch.object(helper, "stream_ready") as probe:
+            self.assertFalse(helper.wait_for_stream("rtsp://u:p@127.0.0.1:1/live", 5,
+                                                    mock.Mock(poll=lambda: None), mock.Mock(pid=1)))
+        probe.assert_not_called()
+
+    def test_capture_runs_the_recorder_with_no_login_and_ends_with_it(self):
+        """live-capture end to end with a stand-in recorder that publishes one request."""
+        server, live_port = self.listener()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        seen = os.path.join(tmp.name, "argv")
+        recorder = os.path.join(tmp.name, "gpu-screen-recorder")
+        with open(recorder, "w") as f:
+            # It leaves in its own time: the capture's SIGINT, sent once the connection is over, is not its end.
+            f.write("#!%s -I\nimport signal, socket, sys, urllib.parse\nsignal.signal(signal.SIGINT, signal.SIG_IGN)\n"
+                    "open(%r, 'w').write(' '.join(sys.argv[1:]))\n"
+                    "u = urllib.parse.urlsplit(sys.argv[-1])\ns = socket.create_connection((u.hostname, u.port))\n"
+                    "s.sendall(b'RECORD rtsp://x/live RTSP/1.0\\r\\nCSeq: 1\\r\\n\\r\\npicture')\n"
+                    "s.shutdown(socket.SHUT_WR)\ns.recv(1)\n" % (sys.executable, seen))
+        os.chmod(recorder, 0o755)
+        code = ("import importlib.machinery, importlib.util, sys\n"
+                "loader = importlib.machinery.SourceFileLoader('helper', sys.argv[1])\n"
+                "helper = importlib.util.module_from_spec(importlib.util.spec_from_loader('helper', loader))\n"
+                "loader.exec_module(helper)\nhelper.LIVE_PORT = int(sys.argv[2])\n"
+                "sys.exit(helper.live_capture(['-w', 'portal']))")
+        capture = subprocess.Popen(
+            [sys.executable, "-I", "-c", code, os.path.join(HERE, "..", "bin", "screenrig-omarchy"), str(live_port)],
+            stdin=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env=dict(os.environ, PATH=tmp.name + os.pathsep + os.environ["PATH"]))
+        self.addCleanup(capture.stderr.close)
+        self.addCleanup(capture.kill)
+        capture.stdin.write(json.dumps({"login": ["pub", "secret"], "server_pid": os.getpid()}) + "\n")
+        capture.stdin.close()
+        server.settimeout(10)
+        upstream = self.accepted(server)
+        upstream.settimeout(10)
+        got = b""
+        while True:
+            data = upstream.recv(4096)
+            if not data:
+                break
+            got += data
+        self.assertEqual(got, b"RECORD rtsp://x/live RTSP/1.0\r\nAuthorization: Basic " + self.LOGIN
+                         + b"\r\nCSeq: 1\r\n\r\npicture")
+        upstream.close()
+        self.assertEqual(capture.wait(timeout=10), 0, capture.stderr.read())
+        with open(seen) as f:
+            argv = f.read()
+        self.assertRegex(argv, r"^-w portal -o rtsp://127\.0\.0\.1:\d+/live$")
+        for secret in ("pub", "secret", self.LOGIN.decode()):
+            self.assertNotIn(secret, argv)
+
+
 class LiveCastStart(unittest.TestCase):
     """live_start with the recorder, mediamtx and the keep-alive replaced by idle processes."""
 
@@ -244,7 +571,7 @@ class LiveCastStart(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         root = self.tmp.name
-        self.children, self.calls, self.probed, self.waits = [], [], [], []
+        self.children, self.calls, self.probed, self.waits, self.told = [], [], [], [], []
         self.fail_on = {}
         # What the backend holds: each screen's takeover and the playlists, so the cleanup's checks have answers.
         self.screens = {sid: {"id": sid, "revision": 5, "takeover": None} for sid in ("scr_A", "scr_B", "scr_C")}
@@ -258,12 +585,20 @@ class LiveCastStart(unittest.TestCase):
         def popen(cmd, **kw):
             if hasattr(kw.get("stdout"), "close"):
                 kw["stdout"].close()
+            # The capture is the helper run again as `live-capture`, with the recorder's arguments after it.
+            if cmd[2:3] == ["live-capture"]:
+                cmd = cmd[2:]
             if cmd[0] in self.fail_on:
                 raise self.fail_on[cmd[0]]
             # Restores SIGINT in case the test run started with it ignored.
             idle = "import signal, time; signal.signal(signal.SIGINT, signal.SIG_DFL); time.sleep(60)"
-            proc = real_popen([sys.executable, "-I", "-c", idle], stdout=subprocess.DEVNULL,
-                              stderr=subprocess.DEVNULL, start_new_session=kw.get("start_new_session", False))
+            proc = real_popen([sys.executable, "-I", "-c", idle], stdin=kw.get("stdin"), text=kw.get("text"),
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              start_new_session=kw.get("start_new_session", False))
+            if proc.stdin is not None:
+                # What live_start tells the capture on its pipe.
+                write = proc.stdin.write
+                proc.stdin.write = lambda text: self.told.append(text) or write(text)
             self.children.append((cmd, proc))
             return proc
 
@@ -322,7 +657,10 @@ class LiveCastStart(unittest.TestCase):
             mock.patch.object(helper, "lan_subnet", return_value="192.0.2.0/24"),
             mock.patch.object(helper, "firewall_state", return_value="ok"),
             mock.patch.object(helper, "mediamtx_binary", return_value="/fake/mediamtx"),
-            mock.patch.object(helper, "wait_for_stream", lambda url, seconds=20, recorder=None: self.probed.append(url) or self.waits.append(seconds) or True),
+            mock.patch.object(helper, "wait_for_stream",
+                              lambda url, seconds, recorder, server: self.probed.append(url) or self.waits.append(seconds) or True),
+            mock.patch.object(helper, "await_server"),
+            mock.patch.object(helper.shutil, "which", lambda name: "/usr/bin/" + name),
             mock.patch.object(helper.time, "sleep"),
             mock.patch.object(helper.subprocess, "run",
                               return_value=subprocess.CompletedProcess([], 0, "", "")),
@@ -363,7 +701,7 @@ class LiveCastStart(unittest.TestCase):
         self.fail_on["playlist"] = helper.Problem("This project holds agent writes for review.")
         with self.assertRaises(helper.Problem):
             self.start(screens=("scr_A", "scr_B"))
-        self.assertStopped("/fake/mediamtx", "gpu-screen-recorder")
+        self.assertStopped("/fake/mediamtx", "live-capture")
         self.assertFalse(os.path.exists(self.live_file("live.json")))
         # No takeover was placed, so none is ended: a failed cast leaves the screens' own overrides alone.
         self.assertEqual(self.cleared(), [])
@@ -372,7 +710,7 @@ class LiveCastStart(unittest.TestCase):
 
     def test_window_cast_asks_the_desktop_picker_and_leaves_nothing_for_it_to_read(self):
         self.start(source="window")
-        recorder = next(cmd for cmd, _ in self.children if cmd[0] == "gpu-screen-recorder")
+        recorder = next(cmd for cmd, _ in self.children if cmd[0] == "live-capture")
         self.assertEqual(recorder[1:5], ["-w", "portal", "-restore-portal-session", "no"])
         # Time for a person to choose the window.
         self.assertEqual(self.waits, [helper.PICK_WAIT_S])
@@ -389,7 +727,7 @@ class LiveCastStart(unittest.TestCase):
 
         def popen(cmd, **kw):
             proc = real(cmd, **kw)
-            if cmd[0] != "gpu-screen-recorder":
+            if cmd[2:3] != ["live-capture"]:
                 return proc
             proc.kill()
             proc.wait()
@@ -404,7 +742,7 @@ class LiveCastStart(unittest.TestCase):
     def test_capture_that_does_not_start_leaves_the_screens_alone(self):
         with mock.patch.object(helper, "wait_for_stream", return_value=False), self.assertRaises(helper.Problem):
             self.start(screens=("scr_A", "scr_B"))
-        self.assertStopped("/fake/mediamtx", "gpu-screen-recorder")
+        self.assertStopped("/fake/mediamtx", "live-capture")
         self.assertFalse(os.path.exists(self.live_file("live.json")))
         self.assertEqual(self.cleared(), [])
 
@@ -417,7 +755,7 @@ class LiveCastStart(unittest.TestCase):
             return real_api(method, path, body, **kw)
         with mock.patch.object(helper, "api", flaky), self.assertRaises(RuntimeError):
             self.start(screens=("scr_A", "scr_B", "scr_C"))
-        self.assertStopped("/fake/mediamtx", "gpu-screen-recorder")
+        self.assertStopped("/fake/mediamtx", "live-capture")
         self.assertFalse(os.path.exists(self.live_file("live.json")))
         self.assertEqual(self.cleared(), ["scr_A"])
 
@@ -443,13 +781,13 @@ class LiveCastStart(unittest.TestCase):
             return real_api(method, path, body, **kw)
         with mock.patch.object(helper, "api", refuse), self.assertRaises(helper.Problem):
             self.start(screens=("scr_A", "scr_B"))
-        self.assertStopped("/fake/mediamtx", "gpu-screen-recorder")
+        self.assertStopped("/fake/mediamtx", "live-capture")
         self.assertFalse(os.path.exists(self.live_file("live.json")))
         self.assertEqual(self.cleared(), [])
 
-    def test_recorder_that_cannot_start_stops_the_server(self):
-        self.fail_on["gpu-screen-recorder"] = FileNotFoundError("gpu-screen-recorder")
-        with self.assertRaises(FileNotFoundError):
+    def test_capture_that_cannot_start_stops_the_server(self):
+        self.fail_on["live-capture"] = OSError("no more processes")
+        with self.assertRaises(OSError):
             self.start(screens=("scr_A", "scr_B"))
         self.assertStopped("/fake/mediamtx")
         self.assertFalse(os.path.exists(self.live_file("live.json")))
@@ -495,10 +833,12 @@ class LiveCastStart(unittest.TestCase):
             return "sha256:" + base64.b64encode(hashlib.sha256(value.encode()).digest()).decode()
         self.assertIn(digest(user), text)
         self.assertIn(digest(password), text)
-        # The recorder publishes over loopback with the cast's second login, which is not the screens'.
-        recorder = next(cmd for cmd, _ in self.children if cmd[0] == "gpu-screen-recorder")
-        sent = re.fullmatch(r"rtsp://([0-9a-f]{16}):([0-9a-f]{32})@127\.0\.0\.1:8554/live", recorder[recorder.index("-o") + 1])
-        self.assertTrue(sent, "the recorder publishes with a random login")
+        # Publishing takes the cast's second login, which is not the screens'. The capture process is told
+        # it on its pipe, with the server it may send the picture to.
+        told = json.loads(self.told[0])
+        self.assertEqual(told["server_pid"], next(proc.pid for cmd, proc in self.children if cmd[0] == "/fake/mediamtx"))
+        sent = re.fullmatch(r"([0-9a-f]{16}):([0-9a-f]{32})", ":".join(told["login"]))
+        self.assertTrue(sent, "publishing takes a random login")
         self.assertNotIn(sent.group(1), (user, password))
         self.assertNotIn(sent.group(2), (user, password))
         for secret in sent.groups():
@@ -512,11 +852,57 @@ class LiveCastStart(unittest.TestCase):
             # Nobody may publish without a login, and a publisher is never replaced.
             self.assertNotIn("any", [u["user"] for u in users])
             self.assertIs(yaml.safe_load(text)["paths"]["live"]["overridePublisher"], False)
+            # RTSP over TCP is the only listener, and it takes the login in the one form the capture sends.
+            conf = yaml.safe_load(text)
+            self.assertEqual([k for k in ("api", "metrics", "pprof", "playback", "rtmp", "hls", "webrtc", "srt", "moq")
+                              if conf[k] is not False], [])
+            self.assertEqual((conf["rtsp"], conf["rtspTransports"], conf["rtspAuthMethods"]), (True, ["tcp"], ["basic"]))
             self.assertEqual(local["permissions"], [{"action": "publish", "path": "live"}])
             self.assertEqual((reader["user"], reader["pass"], reader["ips"]),
                              (digest(user), digest(password), []))
             self.assertEqual(reader["permissions"], [{"action": "read", "path": "live"}])
         helper.live_stop()
+
+    def test_no_command_line_carries_a_login(self):
+        # Every account on the machine can read a command line.
+        self.start(source="window")
+        user, password = self.login(self.playlist_url())
+        publisher = json.loads(self.told[0])["login"]
+        self.assertEqual(len(self.children), 3)
+        for cmd, _ in self.children:
+            for secret in (user, password, *publisher):
+                self.assertNotIn(secret, " ".join(cmd))
+        capture = next(cmd for cmd, _ in self.children if cmd[0] == "live-capture")
+        self.assertNotIn("-o", capture)  # the capture process gives the recorder its address
+        helper.live_stop()
+
+    def test_nothing_is_started_or_sent_when_the_stream_port_is_not_the_casts_server(self):
+        with mock.patch.object(helper, "await_server", side_effect=helper.Problem("held by another program")), \
+                self.assertRaises(helper.Problem):
+            self.start()
+        self.assertStopped("/fake/mediamtx")
+        self.assertEqual((self.told, self.probed, self.calls), ([], [], []))
+
+    def test_recorder_that_hides_its_connections_is_refused_in_words(self):
+        real = helper.subprocess.Popen
+
+        def popen(cmd, **kw):
+            proc = real(cmd, **kw)
+            if cmd[2:3] == ["live-capture"]:
+                proc.poll = lambda: helper.CAPTURE_UNCHECKED
+            return proc
+        with mock.patch.object(helper.subprocess, "Popen", popen), \
+                mock.patch.object(helper, "wait_for_stream", return_value=False), \
+                self.assertRaises(helper.Problem) as raised:
+            self.start(source="window")
+        self.assertIn("file capabilities", str(raised.exception))
+        self.assertEqual(self.cleared(), [])
+
+    def test_missing_recorder_is_said_before_anything_starts(self):
+        with mock.patch.object(helper.shutil, "which", return_value=None), self.assertRaises(helper.Problem) as raised:
+            self.start()
+        self.assertIn("gpu-screen-recorder", str(raised.exception))
+        self.assertEqual(self.children, [])
 
     def test_login_is_kept_only_in_the_private_state_until_the_cast_ends(self):
         self.start()
@@ -557,7 +943,7 @@ class LiveCastStart(unittest.TestCase):
         self.unreadable["scr_A"] = 1
         with mock.patch.object(helper, "warn"), self.assertRaises(helper.Problem):
             self.start()
-        self.assertStopped("/fake/mediamtx", "gpu-screen-recorder")
+        self.assertStopped("/fake/mediamtx", "live-capture")
         self.assertEqual(self.cleared(), ["scr_A"])
         self.assertIsNone(self.takeover_of("scr_A"))
         self.assertFalse(os.path.exists(self.live_file("live.json")))
@@ -578,7 +964,7 @@ class LiveCastStart(unittest.TestCase):
         self.lost.add(("POST", "/api/projects/prj_1/playlists"))
         with mock.patch.object(helper, "warn"), self.assertRaises(helper.Problem):
             self.start(screens=("scr_A", "scr_B"))
-        self.assertStopped("/fake/mediamtx", "gpu-screen-recorder")
+        self.assertStopped("/fake/mediamtx", "live-capture")
         self.assertEqual(self.playlists, {})
         self.assertIn(("DELETE", "/api/playlists/pl_lost", None), self.calls)
         # No screen was asked to take a playlist nobody knew the id of.
