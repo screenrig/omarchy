@@ -1215,6 +1215,9 @@ LIVE_NOTICE = "Live cast"
 # vanishes the lease runs out and the screens return to their own content.
 LIVE_LEASE_MIN = 75
 LIVE_RENEW_S = 3600
+# How often the keep-alive looks at a cast. Screens hold the stream's address and login, so a cast whose
+# server is gone is ended within this long.
+LIVE_CHECK_S = 2
 PICK_WAIT_S = 120  # a window cast waits this long for the person to choose the window
 ASSETS = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "assets")
 FALLBACK_VERSION = 2
@@ -1584,15 +1587,19 @@ def record_process(state, key, pid):
     state.setdefault("born", {})[key] = process_birth(pid)
 
 
-def stream_ready(url):
-    """Whether the RTSP server describes the stream, which it does once the recorder publishes. The login
-    travels in a header: on a command line every user of this machine could read it."""
+def stream_ready(url, server_pid):
+    """Whether the cast's RTSP server describes the stream, which it does once the recorder publishes. The
+    login travels in a header (on a command line every user of this machine could read it), and only on a
+    connection whose other end is the server's own socket."""
     parts = urllib.parse.urlsplit(url)
     login = base64.b64encode(("%s:%s" % (parts.username, parts.password)).encode()).decode()
     target = "rtsp://%s:%d%s" % (parts.hostname, parts.port, parts.path)
     ask = "DESCRIBE %s RTSP/1.0\r\nCSeq: 1\r\nAccept: application/sdp\r\nAuthorization: Basic %s\r\n\r\n" % (target, login)
     try:
-        with socket.create_connection((parts.hostname, parts.port), timeout=5) as conn:
+        conn = server_connection(server_pid, parts.port)
+        if conn is None:
+            return False
+        with conn:
             conn.sendall(ask.encode())
             return conn.recv(64).startswith(b"RTSP/1.0 200")
     except OSError:
@@ -1606,7 +1613,7 @@ def wait_for_stream(url, seconds, recorder, server):
     while time.time() < deadline:
         if recorder.poll() is not None or not serves_port(server.pid, LIVE_PORT):
             return False
-        if stream_ready(url):
+        if stream_ready(url, server.pid):
             return True
         time.sleep(1)
     return False
@@ -1631,8 +1638,15 @@ def tcp_rows():
         for line in lines:
             parts = line.split()
             if len(parts) > 9:
-                rows.append((parts[1], parts[2], parts[3], parts[9]))
+                rows.append((plain_address(parts[1]), plain_address(parts[2]), parts[3], parts[9]))
     return rows
+
+
+def plain_address(printed):
+    """An address:port from /proc/net/tcp6 in the IPv4 table's form when it is an IPv4 address: a server
+    that listens on every address holds its IPv4 connections as IPv6 sockets."""
+    mapped = "0000000000000000FFFF0000"
+    return printed[len(mapped):] if len(printed) == 37 and printed.startswith(mapped) else printed
 
 
 def process_sockets(pid):
@@ -1669,6 +1683,20 @@ def serves_port(pid, port):
     return port_owner_is(pid, port) or port_owner_is(pid, port)
 
 
+def server_connection(server_pid, port):
+    """A loopback connection to `port` whose other end is a socket the cast's server holds, or None.
+    Checking who listens on the port is not enough here: the server may exit and another program take the
+    port between that check and the connect. This checks the connection itself, before anything is sent."""
+    conn = socket.create_connection(("127.0.0.1", port), timeout=5)
+    # The server's end has no owner until the server accepts it, a moment after the connect returns.
+    for _ in range(SERVER_ACCEPT_TRIES):
+        if peer_is(conn, server_pid):
+            return conn
+        time.sleep(0.05)
+    close_socket(conn)
+    return None
+
+
 def peer_is(conn, pid):
     """Whether the other end of an accepted loopback connection is a socket that process `pid` holds.
 
@@ -1685,6 +1713,7 @@ def peer_is(conn, pid):
         return False  # already closed: nobody's
 
 
+SERVER_ACCEPT_TRIES = 20  # a second, in twentieths
 TCP_HOLDS_ADDRESSES = (1, 8)  # tcpi_state, the first byte of TCP_INFO: established, or the peer sent its last byte
 CAPTURE_UNCHECKED = 3  # live-capture's exit status when the recorder's sockets could not be read
 GATE_HEAD_MAX = 64 * 1024
@@ -1754,10 +1783,10 @@ def relay_capture(conn, server_pid, login):
     """Relay the recorder's connection to the cast's RTSP server until either end closes."""
     upstream = None
     try:
-        # The login and the picture go only to the cast's own server: checked on both sides of the connect.
+        # The login and the picture go only to the cast's own server: on a connection it holds the end of.
         if port_owner_is(server_pid, LIVE_PORT):
-            upstream = socket.create_connection(("127.0.0.1", LIVE_PORT), timeout=5)
-        if upstream is None or not port_owner_is(server_pid, LIVE_PORT):
+            upstream = server_connection(server_pid, LIVE_PORT)
+        if upstream is None:
             warn("TCP port %d is not the cast's stream server, so the capture was not sent" % LIVE_PORT)
             return
         upstream.settimeout(None)
@@ -2002,7 +2031,7 @@ def live_keepalive():
 
 def keep_alive_loop(path, stop_now):
     while True:
-        if stop_now.wait(timeout=10):
+        if stop_now.wait(timeout=LIVE_CHECK_S):
             live_stop()
             return 0
         try:

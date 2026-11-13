@@ -1578,14 +1578,49 @@ class Hardening(unittest.TestCase):
         for answer, expected in ((b"RTSP/1.0 200 OK\r\nCSeq: 1\r\n\r\n", True), (b"RTSP/1.0 404 Not Found\r\n\r\n", False)):
             thread = threading.Thread(target=serve, args=(answer,))
             thread.start()
-            self.assertIs(helper.stream_ready("rtsp://u1:p1@127.0.0.1:%d/live" % port), expected)
+            self.assertIs(helper.stream_ready("rtsp://u1:p1@127.0.0.1:%d/live" % port, os.getpid()), expected)
             thread.join()
         self.assertTrue(seen[0].startswith("DESCRIBE rtsp://127.0.0.1:%d/live RTSP/1.0\r\n" % port))
         self.assertIn("Authorization: Basic " + base64.b64encode(b"u1:p1").decode(), seen[0])
         self.assertNotIn("u1:p1@", seen[0])
 
     def test_stream_probe_of_a_closed_port_is_not_ready(self):
-        self.assertFalse(helper.stream_ready("rtsp://u:p@127.0.0.1:1/live"))
+        self.assertFalse(helper.stream_ready("rtsp://u:p@127.0.0.1:1/live", os.getpid()))
+
+    def test_stream_probe_sends_no_login_to_a_program_that_took_the_servers_port(self):
+        # The server exited after the port was checked, and another program listens there now.
+        code = ("import socket, sys\ns = socket.socket()\ns.bind(('127.0.0.1', 0))\ns.listen(1)\n"
+                "print(s.getsockname()[1], flush=True)\nc, _ = s.accept()\nc.settimeout(10)\n"
+                "try:\n    print(len(c.recv(4096)), flush=True)\nexcept OSError as e:\n    print(type(e).__name__, flush=True)\n")
+        other = subprocess.Popen([sys.executable, "-I", "-c", code], stdout=subprocess.PIPE, text=True)
+        self.addCleanup(other.stdout.close)
+        self.addCleanup(other.wait)
+        self.addCleanup(other.kill)
+        port = int(other.stdout.readline())
+        with mock.patch.object(helper, "SERVER_ACCEPT_TRIES", 3):
+            self.assertFalse(helper.stream_ready("rtsp://u1:p1@127.0.0.1:%d/live" % port, os.getpid()))
+        self.assertEqual(other.stdout.readline().strip(), "0", "it was sent nothing before the connection closed")
+
+    def test_a_server_listening_on_every_address_is_recognised_on_its_ipv4_connections(self):
+        # As mediamtx does: one IPv6 socket for both families, so its IPv4 connections are in the IPv6 table.
+        server = socket.socket(socket.AF_INET6)
+        server.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        server.bind(("::", 0))
+        server.listen(1)
+        self.addCleanup(server.close)
+        port = server.getsockname()[1]
+        self.assertTrue(helper.port_owner_is(os.getpid(), port))
+        accepted = []
+        thread = threading.Thread(target=lambda: accepted.append(server.accept()[0]))
+        thread.start()
+        conn = helper.server_connection(os.getpid(), port)
+        thread.join(5)
+        self.addCleanup(accepted[0].close)
+        self.assertIsNotNone(conn)
+        conn.close()
+        self.assertEqual(helper.plain_address("0000000000000000FFFF00000100007F:216A"), "0100007F:216A")
+        self.assertEqual(helper.plain_address("00000000000000000000000001000000:216A"), "00000000000000000000000001000000:216A")
+        self.assertEqual(helper.plain_address("0100007F:216A"), "0100007F:216A")
 
     def subnet(self, ip, addr):
         out = "2: wlan0    inet %s brd 0.0.0.0 scope global wlan0\n" % addr

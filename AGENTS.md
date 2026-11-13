@@ -24,8 +24,8 @@ Rules:
   the API goes into an instruction file. The `ask` IPC call writes a draft;
   the person sends it.
 - A stored pid is a process only with its start time (`cast_process`).
-- Nothing goes to TCP 8554 unless `port_owner_is` says the cast's own
-  mediamtx is the only listener.
+- Nothing goes to TCP 8554 except through `server_connection`, which checks
+  that the connection's other end is the cast's own mediamtx.
 - Gate: `python3 -m unittest discover -s tests` and `omarchy plugin validate .`.
 
 UI:

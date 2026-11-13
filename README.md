@@ -116,9 +116,13 @@ run `screenrig-omarchy setup` to do that at once.
   among the recorder's open files in `/proc`; any other connection is closed
   unread. The plugin adds the login on the way to the stream server and
   closes the port once the recorder is in.
-- **Port 8554.** Before anything is sent there (the picture, or either login)
-  the plugin checks that its own stream server is the only program listening
-  on the port, and it stops the cast if that changes.
+- **Port 8554.** The plugin starts a cast only when its own stream server is
+  the only program listening on the port. It sends the picture and the logins
+  only on a connection whose other end is a socket that server holds, checked
+  after connecting and before the first byte, so a program that takes the
+  port after the server exits is sent nothing. The keep-alive looks every two
+  seconds and ends the cast if the server is gone or the port has another
+  listener.
 
 - **Time.** A timed cast is ended by its own keep-alive process when the time
   is up, so it ends on time when the shell or the panel is not running.
