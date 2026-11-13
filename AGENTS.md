@@ -16,9 +16,14 @@ Rules:
 - A window cast goes through the desktop's screen-share picker. Never answer
   the portal for the person or set `custom_picker_binary`: a picker cannot
   tell which app is asking.
-- Never put a login or token on a command line: every account on the
-  machine can read it. The recorder publishes through `live-capture`'s
-  loopback gate, which holds the publishing login.
+- Never put a login, token or the person's chat message on a command line:
+  every account on the machine can read it. The recorder publishes through
+  `live-capture`'s loopback gate, which holds the publishing login; a chat
+  message goes to the helper in the environment and to the agent on stdin.
+- The agent's brief (`AGENT_BRIEF`) is constant: nothing from the project or
+  the API goes into an instruction file. The `ask` IPC call writes a draft;
+  the person sends it.
+- A stored pid is a process only with its start time (`cast_process`).
 - Nothing goes to TCP 8554 unless `port_owner_is` says the cast's own
   mediamtx is the only listener.
 - Gate: `python3 -m unittest discover -s tests` and `omarchy plugin validate .`.

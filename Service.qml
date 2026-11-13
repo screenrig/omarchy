@@ -67,7 +67,9 @@ Item {
     if (text === "" || agentRunning) return
     addChat({ role: "user", text: text })
     agentRunning = true
-    agentProc.command = [root.helper, "agent-send", text]
+    // In the environment, not an argument: every account on the machine can read a command line.
+    agentProc.environment = ({ "SCREENRIG_AGENT_MESSAGE": text })
+    agentProc.command = [root.helper, "agent-send"]
     agentProc.running = true
     chatUpdated()
   }
@@ -315,7 +317,11 @@ Item {
   }
 
   // `omarchy plugin add` only clones the plugin: link the helper and menus on first load.
-  Component.onCompleted: run(["setup"])
+  // A cast outlives a shell restart: pick it up, so its status and Stop come back.
+  Component.onCompleted: {
+    run(["setup"])
+    refreshLive()
+  }
 
   Process {
     id: follow

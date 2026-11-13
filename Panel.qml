@@ -225,10 +225,12 @@ Item {
     svc.liveStop()
   }
 
-  // IPC: `omarchy-shell shell call screenrig.omarchy ask "…"` opens the chat and sends.
+  // IPC: `omarchy-shell shell call screenrig.omarchy ask "…"` opens the chat with the message written.
+  // The person sends it: a call from another program is never the agent's instruction by itself.
   function ask(text) {
     mode = "agent"
-    if (svc) svc.agentSend(text)
+    agentField.text = String(text || "")
+    agentField.forceActiveFocus()
   }
 
   function dismiss() {

@@ -120,11 +120,18 @@ run `screenrig-omarchy setup` to do that at once.
   the plugin checks that its own stream server is the only program listening
   on the port, and it stops the cast if that changes.
 
+- **Time.** A timed cast is ended by its own keep-alive process when the time
+  is up, so it ends on time when the shell or the panel is not running.
+
 Another account on the same machine can still make a cast fail, by holding
 port 8554 first; it cannot publish to the cast or read it. A
 `gpu-screen-recorder` installed with file capabilities hides its open files,
 so its connection cannot be recognised and the plugin refuses to cast (the
 Arch package installs it without them).
+
+The stream is RTSP over TCP with a login and is not encrypted, as Players read
+it today. Whoever can intercept traffic between this machine and a screen on
+your network can watch or alter what is cast, so cast on a network you trust.
 
 ## Keybindings
 

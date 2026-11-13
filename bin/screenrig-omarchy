@@ -6,6 +6,7 @@ prints one line per snapshot or event until it is stopped.
 """
 
 import base64
+import calendar
 import ctypes
 import glob
 import hashlib
@@ -511,6 +512,14 @@ def iso_in(minutes):
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + minutes * 60))
 
 
+def iso_time(text):
+    """The time iso_in wrote, in seconds; a time that cannot be read is one that has passed."""
+    try:
+        return calendar.timegm(time.strptime(text, "%Y-%m-%dT%H:%M:%SZ"))
+    except (TypeError, ValueError):
+        return 0
+
+
 def screen_action(screen_id, action, arg=None):
     base = "/api/screens/" + screen_id
     if action == "reload":
@@ -729,25 +738,23 @@ def transcript_add(entry):
         f.write(json.dumps(dict(entry, at=time.time())) + "\n")
 
 
-def one_line(value):
-    """A name as one short line of text, so it cannot add lines to the agent's brief."""
-    return " ".join(re.sub(r"[\x00-\x1f\x7f`#<>]", " ", str(value or "")).split())[:80]
+AGENT_BRIEF = (
+    "# screenRIG desktop agent\n\n"
+    "You answer the chat in the screenRIG panel on this Omarchy desktop. The person manages the\n"
+    "signage screens of the screenRIG project the `screenrig` CLI is signed in to.\n\n"
+    "- Use the screenRIG skill and its `screenrig` CLI for everything about screens, playlists,\n"
+    "  media, cards and schedules. The CLI is already signed in to this project.\n"
+    "- Check each screen you change with a screenshot before you say it is done.\n"
+    "- Answer briefly in plain text; the panel shows your messages in a narrow chat.\n"
+)
 
 
 def agent_workspace():
-    """The agent's working folder: what it is for, and the selected project."""
+    """The agent's working folder and its brief. The brief is the same text for everyone: a project's or
+    organization's name is chosen by whoever administers it, and here it would be read as instructions."""
     work = os.path.join(AGENT_DIR, "workspace")
     os.makedirs(work, exist_ok=True)
-    cfg = load_config()
-    brief = (
-        "# screenRIG desktop agent\n\n"
-        "You answer the chat in the screenRIG panel on this Omarchy desktop. The person manages the\n"
-        "signage screens of the screenRIG project %s (%s, organization %s).\n\n"
-        "- Use the screenRIG skill and its `screenrig` CLI for everything about screens, playlists,\n"
-        "  media, cards and schedules. The CLI is already signed in to this project.\n"
-        "- Check each screen you change with a screenshot before you say it is done.\n"
-        "- Answer briefly in plain text; the panel shows your messages in a narrow chat.\n"
-    ) % tuple(one_line(cfg.get(k)) for k in ("project_name", "project_id", "organization_name"))
+    brief = AGENT_BRIEF
     for name in ("AGENTS.md", "CLAUDE.md"):
         path = os.path.join(work, name)
         try:
@@ -791,16 +798,18 @@ def last_line(text):
     return lines[-1][:160] if lines else ""
 
 
-def agent_command(agent, session, text):
+def agent_command(agent, session, message_file):
+    """The agent's command for one turn. The message is not in it: every account on this machine can read
+    a command line. Codex and Claude Code read the message from stdin, Grok from `message_file`."""
     if agent == "codex":
         cmd = ["codex", "exec", "--json", "--skip-git-repo-check"]
-        # `--` ends the options, so a message that starts with a dash is still the message.
-        return cmd + (["resume", session] if session else []) + ["--", text]
+        return cmd + (["resume", session] if session else []) + ["-"]
     if agent == "claude":
         cmd = ["claude", "-p", "--output-format", "stream-json", "--verbose", "--permission-mode", "auto"]
-        return cmd + (["--resume", session] if session else []) + ["--", text]
+        return cmd + (["--resume", session] if session else [])
     if agent == "grok":
-        cmd = ["grok", "--single=" + text, "--output-format", "streaming-messages-json", "--permission-mode", "auto"]
+        cmd = ["grok", "--prompt-file", message_file, "--output-format", "streaming-messages-json",
+               "--permission-mode", "auto"]
         return cmd + (["--resume", session] if session else [])
     raise Problem("Install Claude Code, Codex or Grok and the screenRIG plugin to use the panel chat.")
 
@@ -867,18 +876,29 @@ def agent_send(text):
     agent = panel_agent()
     state = agent_state()
     session = state.get("session") if state.get("agent") == agent else None
-    command = agent_command(agent, session, text)
+    # The message in a file only this user can read, which is also the agent's stdin.
+    message_file = os.path.join(AGENT_DIR, "message.txt")
+    command = agent_command(agent, session, message_file)
     transcript_add({"role": "user", "text": text})
     emit({"kind": "start", "agent": agent, "name": AGENT_NAMES.get(agent, agent), "resumed": bool(session)})
     errors = tempfile.TemporaryFile(mode="w+")
-    proc = subprocess.Popen(command, cwd=agent_workspace(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                            stderr=errors, text=True, bufsize=1)
+    write_private(message_file, text)
+    with open(message_file) as message:
+        proc = subprocess.Popen(command, cwd=agent_workspace(), stdin=message, stdout=subprocess.PIPE,
+                                stderr=errors, text=True, bufsize=1)
+    def forget_message():
+        try:
+            os.remove(message_file)
+        except OSError:
+            pass  # already gone
+
     def stop(signum, frame):
         proc.terminate()
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
+        forget_message()
         transcript_add({"role": "error", "text": "Stopped"})
         emit({"kind": "error", "text": "Stopped"})
         emit({"kind": "done", "ok": False})
@@ -912,6 +932,7 @@ def agent_send(text):
                 transcript_add({"role": "error", "text": ev["text"]})
             emit(ev)
     code = proc.wait()
+    forget_message()
     if code != 0:
         errors.seek(0)
         err = last_line(errors.read())
@@ -1524,7 +1545,7 @@ def live_status():
             state = json.load(f)
     except (OSError, ValueError):
         return {"ok": True, "live": False}
-    alive = all(pid_alive(state.get(k)) for k in ("recorder_pid", "server_pid"))
+    alive = all(cast_process(state, k) for k in ("recorder_pid", "server_pid"))
     # The stream address carries the cast's login; nothing that reads the status needs it.
     return dict({k: v for k, v in state.items() if k != "url"}, ok=True, live=alive)
 
@@ -1537,6 +1558,28 @@ def pid_alive(pid):
         return True
     except (OSError, ValueError):
         return False
+
+
+def process_birth(pid):
+    """When a process started, in the kernel's clock ticks since boot: with its pid, which process it is."""
+    try:
+        with open("/proc/%d/stat" % int(pid)) as f:
+            return f.read().rsplit(")", 1)[1].split()[19]
+    except (OSError, ValueError, IndexError, TypeError):
+        return None
+
+
+def cast_process(state, key):
+    """Whether the process a cast recorded under `key` is still running. A pid alone is not enough: once
+    its process is gone the number is given to another, which must be neither counted nor signalled."""
+    pid = state.get(key)
+    born = (state.get("born") or {}).get(key)
+    return pid_alive(pid) and (born is None or process_birth(pid) == born)
+
+
+def record_process(state, key, pid):
+    state[key] = pid
+    state.setdefault("born", {})[key] = process_birth(pid)
 
 
 def stream_ready(url):
@@ -1823,8 +1866,7 @@ def await_server(server, log):
 
 
 def live_start(source, screens, minutes, label):
-    if live_status().get("live"):
-        live_stop()
+    live_stop()  # whatever an earlier cast left: its server holds the port
     if not screens:
         raise Problem("Pick at least one screen on this network.")
     if not shutil.which("gpu-screen-recorder"):
@@ -1842,8 +1884,9 @@ def live_start(source, screens, minutes, label):
                               stderr=subprocess.STDOUT, start_new_session=True)
     # `screens` holds the screens whose takeover this cast placed. `unsure` holds those asked to take it whose
     # answer was lost; live_stop ends a takeover there only if it is still this cast's playlist.
-    state = {"server_pid": server.pid, "source": source, "label": label, "screens": [], "unsure": [],
+    state = {"source": source, "label": label, "screens": [], "unsure": [],
              "started_at": time.time(), "url": live_url(ip, user, password)}
+    record_process(state, "server_pid", server.pid)
     started = False
     try:
         await_server(server, os.path.join(logs, "mediamtx.log"))
@@ -1861,7 +1904,7 @@ def live_start(source, screens, minutes, label):
             "-c", "rtsp", "-ffmpeg-opts", "rtsp_transport=tcp"],
             publisher, server.pid, open(os.path.join(logs, "recorder.log"), "w"))
         # The capture process leads the recorder's process group, so stopping it stops both.
-        state["recorder_pid"] = recorder.pid
+        record_process(state, "recorder_pid", recorder.pid)
         write_private(os.path.join(LIVE_DIR, "live.json"), json.dumps(state))
         # A window cast waits for the person to choose the window.
         if not wait_for_stream(live_url("127.0.0.1", user, password), PICK_WAIT_S if source == "window" else 20,
@@ -1901,8 +1944,9 @@ def live_start(source, screens, minutes, label):
         if shutil.which("systemd-inhibit"):
             keepalive = ["systemd-inhibit", "--what=sleep:shutdown", "--mode=delay", "--who=screenRIG",
                          "--why=Stop the live cast before sleeping"] + keepalive
-        state["keepalive_pid"] = subprocess.Popen(keepalive, stdout=open(os.path.join(logs, "keepalive.log"), "w"),
-                                                  stderr=subprocess.STDOUT, start_new_session=True).pid
+        record_process(state, "keepalive_pid", subprocess.Popen(
+            keepalive, stdout=open(os.path.join(logs, "keepalive.log"), "w"), stderr=subprocess.STDOUT,
+            start_new_session=True).pid)
         write_private(os.path.join(LIVE_DIR, "live.json"), json.dumps(state))
         remember_cast(source=source, label=label, screens=shown, minutes=str(minutes))
         # Stays up until the cast ends, so Stop is always one click away.
@@ -1956,9 +2000,14 @@ def keep_alive_loop(path, stop_now):
                 state = json.load(f)
         except (OSError, ValueError):
             return 0
-        if not (pid_alive(state.get("recorder_pid")) and pid_alive(state.get("server_pid"))):
+        if not (cast_process(state, "recorder_pid") and cast_process(state, "server_pid")):
             live_stop()
             notify("Live cast stopped", "The capture ended, so the screens went back to their own content.", "normal")
+            return 0
+        # --- D. A timed cast ends here, whether or not the panel is running to end it.
+        if state.get("until") and time.time() >= iso_time(state["until"]):
+            live_stop()
+            notify("Live cast ended", "Its time was up, so the screens went back to their own content.", "low")
             return 0
         if not (port_owner_is(state.get("server_pid"), LIVE_PORT) or port_owner_is(state.get("server_pid"), LIVE_PORT)):
             # The screens hold the stream's address and its login; they must not reach another program there.
@@ -1997,7 +2046,7 @@ def live_stop():
     try:
         for key, sig in (("keepalive_pid", signal.SIGTERM), ("recorder_pid", signal.SIGINT), ("server_pid", signal.SIGTERM)):
             try:
-                if int(state.get(key) or 0) == os.getpgrp() or not pid_alive(state.get(key)):
+                if int(state.get(key) or 0) == os.getpgrp() or not cast_process(state, key):
                     continue
                 os.killpg(int(state[key]), sig)
             except (OSError, ValueError) as err:
@@ -2144,8 +2193,7 @@ def setup():
 def teardown():
     """Undo everything the plugin set up, before `omarchy plugin remove screenrig.omarchy`."""
     done = []
-    if live_status().get("live"):
-        live_stop()
+    if live_stop() != "Nothing is live":
         done.append("live cast stopped")
     undone = live_unsetup()
     if undone != "Nothing to undo":
@@ -2503,7 +2551,9 @@ def main(argv):
             msg = pick_file()
         elif cmd == "agent-send":
             try:
-                return agent_send(" ".join(args))
+                # The panel passes the message in the environment, which other accounts cannot read. A
+                # panel still running from before an update passes it as arguments.
+                return agent_send(os.environ.pop("SCREENRIG_AGENT_MESSAGE", "") or " ".join(args))
             except Problem as err:
                 emit({"kind": "error", "text": str(err)})
                 emit({"kind": "done", "ok": False})
