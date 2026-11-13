@@ -1602,7 +1602,7 @@ def wait_for_stream(url, seconds, recorder, server):
     port is no longer the cast's server: the probe carries the screens' login."""
     deadline = time.time() + seconds
     while time.time() < deadline:
-        if recorder.poll() is not None or not port_owner_is(server.pid, LIVE_PORT):
+        if recorder.poll() is not None or not serves_port(server.pid, LIVE_PORT):
             return False
         if stream_ready(url):
             return True
@@ -1659,6 +1659,12 @@ def port_owner_is(pid, port):
     suffix = ":%04X" % port
     listeners = {inode for local, _, state, inode in tcp_rows() if state == "0A" and local.endswith(suffix)}
     return bool(listeners) and listeners <= process_sockets(pid)
+
+
+def serves_port(pid, port):
+    """port_owner_is, read a second time before saying no: one table read that fell between two states
+    must not end a healthy cast. Each read is a whole check, so reading twice lets nothing more in."""
+    return port_owner_is(pid, port) or port_owner_is(pid, port)
 
 
 def peer_is(conn, pid):
@@ -1789,7 +1795,9 @@ def serve_gate(gate, recorder_pid, server_pid, login, done, unchecked):
                 candidate, _ = gate.accept()
             except OSError:
                 return
-            if peer_is(candidate, recorder_pid):
+            # Asked twice before turning it away: it is the recorder's only connection, and each answer
+            # is a whole check of this connection, so asking again admits nothing else.
+            if peer_is(candidate, recorder_pid) or peer_is(candidate, recorder_pid):
                 conn = candidate
             else:
                 close_socket(candidate)
@@ -2009,9 +2017,8 @@ def keep_alive_loop(path, stop_now):
             live_stop()
             notify("Live cast ended", "Its time was up, so the screens went back to their own content.", "low")
             return 0
-        if not (port_owner_is(state.get("server_pid"), LIVE_PORT) or port_owner_is(state.get("server_pid"), LIVE_PORT)):
+        if not serves_port(state.get("server_pid"), LIVE_PORT):
             # The screens hold the stream's address and its login; they must not reach another program there.
-            # Read twice: one unreadable table must not end a healthy cast.
             live_stop()
             notify("Live cast stopped", "Another program is listening on the stream's port, so the cast ended.", "normal")
             return 0

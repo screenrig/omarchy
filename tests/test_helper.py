@@ -556,6 +556,12 @@ class CaptureGate(unittest.TestCase):
                                                     mock.Mock(poll=lambda: None), mock.Mock(pid=1)))
         probe.assert_not_called()
 
+    def test_one_unreadable_port_table_does_not_end_the_wait_for_a_window(self):
+        with mock.patch.object(helper, "port_owner_is", side_effect=[False, True]), \
+                mock.patch.object(helper, "stream_ready", return_value=True):
+            self.assertTrue(helper.wait_for_stream("rtsp://u:p@127.0.0.1:1/live", 5,
+                                                   mock.Mock(poll=lambda: None), mock.Mock(pid=1)))
+
     def test_capture_runs_the_recorder_with_no_login_and_ends_with_it(self):
         """live-capture end to end with a stand-in recorder that publishes one request."""
         server, live_port = self.listener()
@@ -1083,7 +1089,7 @@ class LiveCastStart(unittest.TestCase):
         self.start(screens=("scr_A",))
         with open(self.live_file("live.json")) as f:
             state = json.load(f)
-        self.assertEqual(helper.iso_time(state["until"]) // 60, (int(time.time()) + 30 * 60) // 60)
+        self.assertAlmostEqual(helper.iso_time(state["until"]), time.time() + 30 * 60, delta=5)
 
         class Stop(Exception):
             pass
