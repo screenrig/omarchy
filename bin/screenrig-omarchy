@@ -2707,8 +2707,10 @@ class Follower:
             if word in ("shown", "hidden"):
                 self.set_shown(word == "shown")
             elif word == "shot" and SAFE_ID.fullmatch(arg):
-                # The person's own capture: the rotation leaves that screen alone for a while.
+                # The person's own capture: the rotation leaves that screen alone for a while, and starts no
+                # other capture until it has had its time.
                 self.shot_due[arg] = time.time() + SHOT_MIN_AGE_S
+                self.shot_next = max(self.shot_next, time.time() + SHOT_WAIT_S)
         self.set_shown(False)
 
     def shot_turn(self):
@@ -2734,15 +2736,16 @@ class Follower:
         path = shot_path(sid)
         try:
             # A capture someone else asked for lately (the dashboard, an agent) will do: never ask over one
-            # still pending, and take a recent one instead of asking again.
+            # still pending, and take a recent one this copy does not have instead of asking again. The time is
+            # the server's: one ahead of this clock is no reason to wait.
             status = api("GET", "/api/screens/%s/screenshot/status" % sid)
             taken = iso_time((status.get("captured_at") or "")[:19] + "Z") if status.get("state") == "ready" else 0
+            have = os.path.getmtime(path) if os.path.exists(path) else 0
             if status.get("state") == "pending":
                 pass
-            elif now - taken < SHOT_MIN_AGE_S:
+            elif taken > have and 0 <= now - taken < SHOT_MIN_AGE_S:
                 self.shot_due[sid] = taken + SHOT_MIN_AGE_S
-                if not os.path.exists(path) or os.path.getmtime(path) < taken:
-                    fetch_shot(sid)
+                fetch_shot(sid)
             else:
                 emit({"kind": "shooting", "id": sid})
                 fetch_shot(sid, fresh=True)

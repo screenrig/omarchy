@@ -1851,13 +1851,13 @@ class ShotRotation(unittest.TestCase):
             self.inflight = (sid, "cap_%d" % len(self.calls), now)
             return {"capture_id": self.inflight[1]}
         if rest == "/status":
-            if sid in self.others:
-                return self.others[sid]
             if self.inflight and self.inflight[0] == sid:
                 return {"state": "pending"} if sid in self.silent else \
                     {"state": "ready", "capture_id": self.inflight[1], "captured_at": self.iso(now)}
-            return {"state": "idle"}
+            return self.others.get(sid, {"state": "idle"})
         if self.inflight and self.inflight[0] == sid:
+            # As the API does, the status keeps naming the screen's latest capture.
+            self.others[sid] = {"state": "ready", "capture_id": self.inflight[1], "captured_at": self.iso(now)}
             self.inflight = None
         return b"webp", {}
 
@@ -1918,6 +1918,8 @@ class ShotRotation(unittest.TestCase):
     def test_a_press_comes_first_and_resets_that_screen(self):
         self.follower.control_loop(iter(["shown\n", "shot scr_B\n", "shown\n"]))
         self.follower.shown = True
+        # Nothing starts while the press waits for its picture; then B is left alone.
+        self.assertEqual(self.follower.shot_turn(), helper.SHOT_WAIT_S)
         self.turns(helper.SHOT_MIN_AGE_S - 1)
         self.assertEqual(self.asked(), ["scr_A", "scr_C"])
 
@@ -1930,6 +1932,12 @@ class ShotRotation(unittest.TestCase):
         self.assertEqual(self.asked(), ["scr_C"])
         # A's recent capture is downloaded instead of asked for again.
         self.assertIn(("GET", "scr_A", ""), [c[:3] for c in self.calls])
+
+    def test_a_capture_stamped_ahead_of_this_clock_does_not_push_the_screen_out(self):
+        self.others["scr_B"] = {"state": "ready", "capture_id": "cap_x", "captured_at": self.iso(self.clock[0] + 7200)}
+        self.follower.shown = True
+        self.turns(helper.SHOT_MIN_AGE_S * 2)
+        self.assertIn("scr_B", self.asked())
 
     def test_rate_limited_holds_for_the_time_the_api_gives(self):
         self.refusal = helper.Problem("This organization's screenshot limit", 429, retry_after=300)
