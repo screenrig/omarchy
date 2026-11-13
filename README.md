@@ -19,8 +19,10 @@ your coding agent to change what plays.
   drops, credits run low or a cast is live. Click for the panel, right-click to
   cast a region capture, middle-click to stop a live cast.
 - **Screens**: every screen with its latest screenshot, what it plays and when
-  it was last seen. Reload, switch playlist, turn the display off, override
-  for a while, take a fresh screenshot, restart, or open it in the dashboard.
+  it was last seen. While the panel shows your screens it asks them for fresh
+  screenshots itself, one screen at a time and each at most every two minutes.
+  Reload, switch playlist, turn the display off, override for a while, take a
+  fresh screenshot, restart, or open it in the dashboard.
 - **Cast**: a live cast of your desktop or one app window to Android and Linux
   Players on your network, picked from live thumbnails with the arrow keys and
   Return, until you stop it or for a set time; or a region capture, the

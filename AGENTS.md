@@ -31,6 +31,11 @@ Rules:
   (`cast_process`).
 - Nothing goes to TCP 8554 except through `server_connection`, which checks
   that the connection's other end is the cast's own mediamtx.
+- Fresh screenshots: `follow` asks one online screen at a time, only while the
+  panel tells it `shown` on stdin (`Follower.shot_turn`); a person's press is
+  `shot ID` and comes first. It never asks over a pending capture and never
+  refreshes the snapshot for a screenshot event: snapshot reads count toward
+  the hourly request cap, screenshot routes do not.
 - Gate: `python3 -m unittest discover -s tests` and `omarchy plugin validate .`.
 
 UI:

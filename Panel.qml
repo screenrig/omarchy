@@ -121,6 +121,13 @@ Item {
   }
 
   readonly property var svc: service
+  // While the Screens view is open the follower keeps the screenshots fresh, one screen at a time.
+  Binding {
+    target: root.svc
+    when: !!root.svc
+    property: "screensShown"
+    value: root.opened && root.mode === "screens"
+  }
   readonly property color fg: Commons.Color.popups.text
   readonly property color base: Qt.rgba(Commons.Color.popups.background.r, Commons.Color.popups.background.g, Commons.Color.popups.background.b, 1)
   readonly property color surface: Qt.darker(base, 1.08)
@@ -1203,6 +1210,11 @@ Item {
                     readonly property var restart: root.restartAction(s)
                     readonly property bool hot: tileHover.hovered
                     readonly property bool focused: root.focusId === s.id
+                    // The image the rotation fetched since the last snapshot, else the snapshot's.
+                    readonly property var fresh: root.svc ? root.svc.freshShots[s.id] : undefined
+                    readonly property string shot: fresh ? fresh.shot : (s.shot || "")
+                    readonly property real shotMtime: fresh ? fresh.mtime : s.shot_mtime
+                    readonly property bool shooting: !!root.svc && (!!root.svc.pressedIds[s.id] || root.svc.shootingId === s.id)
                     width: grid.cellWidth
                     height: grid.cellHeight
 
@@ -1267,14 +1279,14 @@ Item {
 
                         Rectangle { anchors.fill: parent; color: root.well }
                         Logomark {
-                          visible: !tile.s.shot || shotImage.status !== Image.Ready
+                          visible: !tile.shot || shotImage.status !== Image.Ready
                           anchors.centerIn: parent
                           anchors.verticalCenterOffset: -Style.space(8)
                           size: Style.space(34)
                           color: Util.alpha(root.fg, 0.10)
                         }
                         Label {
-                          visible: !tile.s.shot
+                          visible: !tile.shot
                           anchors.horizontalCenter: parent.horizontalCenter
                           anchors.top: parent.verticalCenter
                           anchors.topMargin: Style.space(18)
@@ -1285,7 +1297,7 @@ Item {
                         Image {
                           id: shotImage
                           anchors.fill: parent
-                          source: tile.s.shot ? "file://" + tile.s.shot + "?" + tile.s.shot_mtime + "-" + root.shotBump : ""
+                          source: tile.shot ? "file://" + tile.shot + "?" + tile.shotMtime + "-" + root.shotBump : ""
                           cache: false
                           asynchronous: true
                           fillMode: Image.PreserveAspectFit
@@ -1305,6 +1317,16 @@ Item {
                             GradientStop { position: 0; color: "transparent" }
                             GradientStop { position: 1; color: Qt.rgba(0, 0, 0, 0.6) }
                           }
+                        }
+                        // A fresh screenshot is on its way: a hairline of accent along the bottom edge.
+                        Rectangle {
+                          anchors.left: parent.left
+                          anchors.right: parent.right
+                          anchors.bottom: parent.bottom
+                          height: Style.space(2)
+                          color: root.accent
+                          opacity: tile.shooting ? 0.8 : 0
+                          Behavior on opacity { NumberAnimation { duration: root.d(320); easing.type: Easing.BezierSpline; easing.bezierCurve: Style.easeOut } }
                         }
                       }
 
@@ -1402,7 +1424,7 @@ Item {
                                 if (a === "pick-switch") root.picker = { screenId: tile.s.id, label: tile.s.label, action: "switch" }
                                 else if (a === "pick-override") root.picker = { screenId: tile.s.id, label: tile.s.label, action: "override" }
                                 else if (a === "dashboard") Qt.openUrlExternally("https://screenrig.ai/dashboard/screens/" + tile.s.id)
-                                else if (a === "shot") root.svc.run(["act", tile.s.id, "shot"], function(ok, message) {
+                                else if (a === "shot") root.svc.takeShot(tile.s.id, function(ok, message) {
                                   root.svc.report(ok, message)
                                   root.shotBump++
                                 })

@@ -1808,6 +1808,182 @@ class BadAnswers(unittest.TestCase):
         self.assertEqual([s["ok"] for s in sent], [True, False])
 
 
+class ShotRotation(unittest.TestCase):
+    """The panel's automatic screenshots against a stand-in for the screenshot API, on a clock of its own."""
+
+    def setUp(self):
+        self.clock = [time.time()]
+        self.cache = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.cache)
+        fake_time = mock.Mock(wraps=time)
+        fake_time.time = lambda: self.clock[0]
+        fake_time.sleep = lambda s: self.clock.__setitem__(0, self.clock[0] + s)
+        self.calls, self.events = [], []
+        self.inflight = None          # (screen, capture, asked at) of the capture the API is waiting for
+        self.silent = set()           # screens whose Player never sends its picture
+        self.others = {}              # screen -> the status someone else's capture left
+        self.refusal = None           # what a capture request raises
+        for patch in (mock.patch.object(helper, "time", fake_time), mock.patch.object(helper, "CACHE", self.cache),
+                      mock.patch.object(helper, "api", self.api), mock.patch.object(helper, "emit", self.events.append)):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.follower = helper.Follower(do_notify=False)
+        self.follower.snap = {"screens": [{"id": i, "online": i != "scr_D"} for i in ("scr_A", "scr_B", "scr_C", "scr_D")]}
+        # Every screen but B has a stored copy: B was paired and never captured.
+        for sid in ("scr_A", "scr_C", "scr_D"):
+            self.store(sid)
+
+    def store(self, sid):
+        os.makedirs(os.path.join(self.cache, "shots"), exist_ok=True)
+        with open(helper.shot_path(sid), "wb") as f:
+            f.write(b"old")
+
+    def api(self, method, path, body=None, **kw):
+        sid, rest = re.fullmatch(r"/api/screens/(\w+)/screenshot(.*)", path).groups()
+        now = self.clock[0]
+        self.calls.append((method, sid, rest, now))
+        if self.inflight and now >= self.inflight[2] + helper.SHOT_WAIT_S:
+            self.inflight = None      # the API's capture lifetime passed
+        if method == "POST":
+            if self.refusal:
+                raise self.refusal
+            self.assertIsNone(self.inflight, "a second capture was asked for while one was in flight")
+            self.inflight = (sid, "cap_%d" % len(self.calls), now)
+            return {"capture_id": self.inflight[1]}
+        if rest == "/status":
+            if sid in self.others:
+                return self.others[sid]
+            if self.inflight and self.inflight[0] == sid:
+                return {"state": "pending"} if sid in self.silent else \
+                    {"state": "ready", "capture_id": self.inflight[1], "captured_at": self.iso(now)}
+            return {"state": "idle"}
+        if self.inflight and self.inflight[0] == sid:
+            self.inflight = None
+        return b"webp", {}
+
+    @staticmethod
+    def iso(at):
+        return time.strftime("%Y-%m-%dT%H:%M:%S.123Z", time.gmtime(at))
+
+    def turns(self, seconds):
+        """Run the rotation the way shots_loop does, for this long on its clock."""
+        end = self.clock[0] + seconds
+        while self.clock[0] < end:
+            wait = self.follower.shot_turn()
+            if wait is None:
+                return
+            self.clock[0] += min(wait, end - self.clock[0])
+
+    def asked(self):
+        return [sid for method, sid, _, _ in self.calls if method == "POST"]
+
+    def image(self, sid):
+        with open(helper.shot_path(sid), "rb") as f:
+            return f.read()
+
+    def test_one_capture_at_a_time_round_robin_with_the_never_captured_screen_first(self):
+        self.follower.control_loop(iter(["shown\n"]))
+        self.follower.shown = True
+        self.turns(helper.SHOT_MIN_AGE_S * 2 + 1)
+        # B first; offline D never; each screen again only after the minimum age.
+        self.assertEqual(self.asked(), ["scr_B", "scr_A", "scr_C"] * 2 + ["scr_B"])
+        posts = [at for method, _, _, at in self.calls if method == "POST"]
+        self.assertTrue(all(b - a >= helper.SHOT_GAP_S for a, b in zip(posts, posts[1:])))
+        for sid in ("scr_A", "scr_B", "scr_C"):
+            at = [t for method, s, _, t in self.calls if method == "POST" and s == sid]
+            self.assertTrue(all(b - a >= helper.SHOT_MIN_AGE_S for a, b in zip(at, at[1:])))
+        # The tile hears of each image as it lands, and of the capture under way.
+        landed = [e["id"] for e in self.events if e["kind"] == "shot"]
+        self.assertEqual(landed[:3], ["scr_B", "scr_A", "scr_C"])
+        self.assertEqual(self.image("scr_B"), b"webp")
+        self.assertIn({"kind": "shooting", "id": "scr_B"}, self.events)
+        self.assertEqual(self.events[-1], {"kind": "shooting", "id": ""})
+
+    def test_a_timeout_moves_on_to_the_next_screen(self):
+        self.silent.add("scr_B")
+        self.follower.shown = True
+        self.turns(60)
+        self.assertEqual(self.asked()[:2], ["scr_B", "scr_A"])
+        b, a = [at for method, _, _, at in self.calls if method == "POST"][:2]
+        self.assertLessEqual(a - b, helper.SHOT_WAIT_S + helper.SHOT_GAP_S + 1)
+        self.assertNotIn("scr_B", [e.get("id") for e in self.events if e["kind"] == "shot"])
+        self.assertEqual(self.image("scr_A"), b"webp")
+
+    def test_offline_screens_keep_their_stored_image(self):
+        self.follower.shown = True
+        self.turns(helper.SHOT_MIN_AGE_S * 3)
+        self.assertNotIn("scr_D", [sid for _, sid, _, _ in self.calls])
+        self.assertEqual(self.image("scr_D"), b"old")
+
+    def test_a_press_comes_first_and_resets_that_screen(self):
+        self.follower.control_loop(iter(["shown\n", "shot scr_B\n", "shown\n"]))
+        self.follower.shown = True
+        self.turns(helper.SHOT_MIN_AGE_S - 1)
+        self.assertEqual(self.asked(), ["scr_A", "scr_C"])
+
+    def test_someone_else_s_capture_is_never_replaced(self):
+        self.others["scr_B"] = {"state": "pending", "capture_id": "cap_theirs"}
+        self.others["scr_A"] = {"state": "ready", "capture_id": "cap_recent", "captured_at": self.iso(self.clock[0] - 30)}
+        os.utime(helper.shot_path("scr_A"), (self.clock[0] - 3600,) * 2)
+        self.follower.shown = True
+        self.turns(helper.SHOT_GAP_S * 3)
+        self.assertEqual(self.asked(), ["scr_C"])
+        # A's recent capture is downloaded instead of asked for again.
+        self.assertIn(("GET", "scr_A", ""), [c[:3] for c in self.calls])
+
+    def test_rate_limited_holds_for_the_time_the_api_gives(self):
+        self.refusal = helper.Problem("This organization's screenshot limit", 429, retry_after=300)
+        self.follower.shown = True
+        self.assertEqual(self.follower.shot_turn(), 300)
+        self.assertEqual(self.asked(), ["scr_B"])
+        del self.calls[:]
+        self.turns(299)
+        self.assertEqual(self.asked(), [])
+        self.refusal = None
+        self.turns(2)
+        self.assertEqual(self.asked(), ["scr_A"])
+
+    def test_a_screen_this_sign_in_may_not_capture_waits_an_hour(self):
+        self.refusal = helper.Problem("You may not.", 403)
+        self.follower.shown = True
+        self.follower.shot_turn()
+        self.refusal = None
+        del self.calls[:]
+        self.turns(helper.SHOT_DENIED_S - 1)
+        self.assertNotIn("scr_B", self.asked())
+        self.assertIn("scr_A", self.asked())
+        self.turns(2)
+        self.assertIn("scr_B", self.asked())
+
+    def test_nothing_is_asked_while_the_panel_does_not_show_the_screens(self):
+        self.assertIsNone(self.follower.shot_turn())
+        self.follower.control_loop(iter(["shown\n", "hidden\n"]))
+        self.assertIsNone(self.follower.shot_turn())
+        # The shell went away: its stdin ends, and so do the screenshots.
+        self.follower.control_loop(iter(["shown\n"]))
+        self.assertIsNone(self.follower.shot_turn())
+        self.assertEqual(self.calls, [])
+
+    def test_screenshot_events_do_not_refresh_the_snapshot(self):
+        self.follower.on_event({"type": "screen.screenshot_ready", "resource": {"id": "scr_A"}})
+        self.assertFalse(self.follower.dirty.is_set())
+        self.follower.on_event({"type": "screen.online", "resource": {"id": "scr_A"}})
+        self.assertTrue(self.follower.dirty.is_set())
+
+
+class RetryAfter(unittest.TestCase):
+    def test_a_refusal_carries_the_retry_time(self):
+        err = urllib.error.HTTPError("https://api.example.invalid/x", 429, "x", {"Retry-After": "42"},
+                                     io.BytesIO(b'{"code":"rate_limited","detail":"slow down"}'))
+        self.addCleanup(err.close)
+        with mock.patch.object(helper, "access_token", return_value=({"api_url": "https://api.example.invalid"}, "t")), \
+             mock.patch.object(helper.urllib.request, "urlopen", side_effect=err), \
+             self.assertRaises(helper.Problem) as caught:
+            helper.api("POST", "/api/screens/scr_A/screenshot", idempotent=True)
+        self.assertEqual((caught.exception.status, caught.exception.retry_after, str(caught.exception)),
+                         (429, 42, "slow down"))
+
+
 class PluginLookup(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

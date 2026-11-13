@@ -34,6 +34,36 @@ Item {
   property var projects: []
   property bool switching: false
 
+  // Fresh screenshots: the follower asks one online screen at a time while the panel shows the screens
+  // (`screensShown`). `freshShots` maps a screen id to the image that landed since the last snapshot,
+  // `shootingId` names the screen the rotation is asking now and `pressedIds` those the person asked.
+  property bool screensShown: false
+  property var freshShots: ({})
+  property string shootingId: ""
+  property var pressedIds: ({})
+  onScreensShownChanged: tellFollower(screensShown ? "shown" : "hidden")
+
+  function tellFollower(line) {
+    if (follow.running) follow.write(line + "\n")
+  }
+
+  // The person's own capture comes first; the rotation leaves that screen alone for a while.
+  function takeShot(screenId, done) {
+    pressed(screenId, true)
+    tellFollower("shot " + screenId)
+    run(["act", screenId, "shot"], function(ok, message, answer) {
+      root.pressed(screenId, false)
+      if (done) done(ok, message, answer)
+    })
+  }
+
+  function pressed(screenId, on) {
+    var ids = Object.assign({}, pressedIds)
+    if (on) ids[screenId] = true
+    else delete ids[screenId]
+    pressedIds = ids
+  }
+
   signal actionFinished(bool ok, string message)
   // ------------------------------------------------------------ agent chat
   // One headless session with the default agent, resumed on every message.
@@ -259,8 +289,15 @@ Item {
       if (msg.credits) credits = msg.credits
       snapshotAt = msg.at * 1000
       droppedIds = dropped
+      freshShots = ({})
       ready = true
       lastError = ""
+    } else if (msg.kind === "shot") {
+      var shots = Object.assign({}, freshShots)
+      shots[msg.id] = { shot: msg.shot, mtime: msg.shot_mtime }
+      freshShots = shots
+    } else if (msg.kind === "shooting") {
+      shootingId = msg.id || ""
     } else if (msg.kind === "status") {
       connected = !!msg.ok
       if (!msg.ok) lastError = msg.error || "Disconnected"
@@ -327,6 +364,9 @@ Item {
     id: follow
     running: true
     command: [root.helper, "follow", "--notify"]
+    // The panel tells the follower when it shows the screens and when the person takes a screenshot.
+    stdinEnabled: true
+    onStarted: if (root.screensShown) root.tellFollower("shown")
     stdout: SplitParser {
       onRead: function(line) { root.ingest(line) }
     }
@@ -335,6 +375,7 @@ Item {
     }
     onExited: function() {
       root.connected = false
+      root.shootingId = ""
       reconnect.restart()
     }
   }

@@ -56,9 +56,11 @@ _print_lock = threading.Lock()
 class Problem(Exception):
     """An API or local failure with a message a person can act on."""
 
-    def __init__(self, message, status=None):
+    def __init__(self, message, status=None, retry_after=None):
         super().__init__(message)
         self.status = status
+        # Seconds the API asked to wait (Retry-After), when it said.
+        self.retry_after = retry_after
 
 
 class Uncertain(Problem):
@@ -388,8 +390,12 @@ def _send(method, path, body, raw, headers, _retried=False):
             access_token(force=True)
             return _send(method, path, body, raw, headers, _retried=True)
         message = problem_message(err.code, payload)
+        try:
+            retry_after = max(0, int((err.headers or {}).get("Retry-After") or ""))
+        except ValueError:
+            retry_after = None
         # A gateway or server failure can follow a change that was applied.
-        raise (Uncertain if err.code >= 500 else Problem)(message, err.code)
+        raise (Uncertain if err.code >= 500 else Problem)(message, err.code, retry_after)
     except urllib.error.URLError as err:
         raise Uncertain("Cannot reach screenRIG: %s" % err.reason) from err
     except (http.client.HTTPException, OSError, ValueError) as err:
@@ -409,6 +415,17 @@ def paged(path):
 
 
 # ------------------------------------------------------------------ snapshot
+
+# Fresh screenshots while the panel shows the screens: one capture at a time, round robin. Capture requests,
+# their status and the image are not counted toward the organization's hourly request cap; the API holds them
+# to 10 a minute per screen and 30 a minute per organization, shared with its agents and the dashboard.
+SHOT_WAIT_S = 30        # the API's capture lifetime: a Player that has not sent its picture by then will not
+SHOT_GAP_S = 10         # between one capture's end and the next request: at most 6 a minute, a fifth of the
+                        # organization's screenshot limit
+SHOT_MIN_AGE_S = 120    # a screen is asked again at most every two minutes, counted from anyone's request
+SHOT_HOLD_S = 60        # after a refusal that names no Retry-After
+SHOT_DENIED_S = 3600    # a screen refused with 402 or 403 (a capture needs Propose or Manage access to it)
+
 
 def shot_path(screen_id):
     return os.path.join(CACHE, "shots", screen_id + ".webp")
@@ -476,24 +493,31 @@ def snapshot():
 
 
 def fetch_shot(screen_id, fresh=False):
+    """The screen's stored screenshot, or with fresh=True a new capture."""
     os.makedirs(os.path.dirname(shot_path(screen_id)), exist_ok=True)
     capture = ""
     if fresh:
         started = api("POST", "/api/screens/%s/screenshot" % screen_id, idempotent=True)
         capture = started.get("capture_id", "")
-        deadline = time.time() + 30
-        while time.time() < deadline:
+        deadline = time.time() + SHOT_WAIT_S
+        while True:
             status = api("GET", "/api/screens/%s/screenshot/status" % screen_id)
             if status.get("state") == "ready":
+                # A request made since (the dashboard, an agent, the panel's rotation) replaces this one: the
+                # screen's newest capture is the one to show.
+                capture = status.get("capture_id") or capture
                 break
             if status.get("state") in ("timed_out", "unavailable"):
                 raise Problem("The screen did not return a screenshot (%s)." % status.get("state"))
+            if time.time() >= deadline:
+                raise Problem("The screen did not return a screenshot (timed_out).")
             time.sleep(1)
     q = "?capture_id=" + urllib.parse.quote(capture) if capture else ""
     data, _ = api("GET", "/api/screens/%s/screenshot%s" % (screen_id, q), raw=True,
                   headers={"Accept": "image/webp"})
-    tmp = shot_path(screen_id) + ".tmp"
-    with open(tmp, "wb") as f:
+    # The panel's rotation, the snapshot loop and a separate `shot` command can write the same screen at once.
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(shot_path(screen_id)), suffix=".tmp")
+    with os.fdopen(fd, "wb") as f:
         f.write(data)
     os.replace(tmp, shot_path(screen_id))
     return shot_path(screen_id)
@@ -2664,6 +2688,87 @@ class Follower:
         self.publish_lock = threading.Lock()
         self.credits_low = None
         self.seen_reviews = None
+        # The screenshot rotation: whether the panel shows the screens, when each screen may be asked again for a
+        # capture, and when the next capture may start (the gap, or the API's hold).
+        self.shown = False
+        self.shots_wake = threading.Event()
+        self.shot_due = {}
+        self.shot_next = 0.0
+
+    def set_shown(self, shown):
+        self.shown = shown
+        self.shots_wake.set()
+
+    def control_loop(self, lines):
+        """The panel's lines on stdin: `shown` and `hidden` as it shows and hides the screens, `shot ID` when the
+        person asks a screen for a screenshot. Without the panel (stdin ends) the screens are not shown."""
+        for line in lines:
+            word, _, arg = line.strip().partition(" ")
+            if word in ("shown", "hidden"):
+                self.set_shown(word == "shown")
+            elif word == "shot" and SAFE_ID.fullmatch(arg):
+                # The person's own capture: the rotation leaves that screen alone for a while.
+                self.shot_due[arg] = time.time() + SHOT_MIN_AGE_S
+        self.set_shown(False)
+
+    def shot_turn(self):
+        """Ask one online screen for a fresh screenshot and wait for it; return the seconds until the next turn,
+        or None to wait for the panel. The screen due longest goes first, one never captured before the rest."""
+        if not self.shown:
+            return None
+        now = time.time()
+        if now < self.shot_next:
+            return self.shot_next - now
+        online = [s for s in (self.snap or {}).get("screens", []) if s.get("online")]
+        if not online:
+            return SHOT_GAP_S
+        order = {s["id"]: i for i, s in enumerate(online)}
+        sid = min(online, key=lambda s: (self.shot_due.get(s["id"], 0), os.path.exists(shot_path(s["id"])),
+                                         order[s["id"]]))["id"]
+        due = self.shot_due.get(sid, 0)
+        if due > now:
+            return due - now
+        # The turn counts whether the capture lands, times out or is refused.
+        self.shot_due[sid] = now + SHOT_MIN_AGE_S
+        hold = SHOT_GAP_S
+        path = shot_path(sid)
+        try:
+            # A capture someone else asked for lately (the dashboard, an agent) will do: never ask over one
+            # still pending, and take a recent one instead of asking again.
+            status = api("GET", "/api/screens/%s/screenshot/status" % sid)
+            taken = iso_time((status.get("captured_at") or "")[:19] + "Z") if status.get("state") == "ready" else 0
+            if status.get("state") == "pending":
+                pass
+            elif now - taken < SHOT_MIN_AGE_S:
+                self.shot_due[sid] = taken + SHOT_MIN_AGE_S
+                if not os.path.exists(path) or os.path.getmtime(path) < taken:
+                    fetch_shot(sid)
+            else:
+                emit({"kind": "shooting", "id": sid})
+                fetch_shot(sid, fresh=True)
+            if os.path.exists(path):
+                emit({"kind": "shot", "id": sid, "shot": path, "shot_mtime": int(os.path.getmtime(path))})
+        except Problem as err:
+            # A screen that cannot take one keeps its stored image; the panel shows nothing more.
+            if err.retry_after is not None:
+                hold = max(hold, err.retry_after)
+            elif err.status == 429:
+                hold = SHOT_HOLD_S
+            elif err.status in (402, 403):
+                # Refused for this screen (outside this sign-in's screens, or no Propose or Manage access).
+                self.shot_due[sid] = now + SHOT_DENIED_S
+        except OSError:
+            pass
+        finally:
+            emit({"kind": "shooting", "id": ""})
+        self.shot_next = time.time() + hold
+        return hold
+
+    def shots_loop(self):
+        while True:
+            wait = self.shot_turn()
+            self.shots_wake.wait(timeout=wait)
+            self.shots_wake.clear()
 
     def refresh(self):
         try:
@@ -2729,7 +2834,9 @@ class Follower:
 
     def on_event(self, ev):
         etype = ev.get("type", "")
-        if etype.startswith("screen.") or etype.startswith("playlist.") or etype.startswith("operation."):
+        # A screenshot's events change nothing in the snapshot, whose reads count toward the hourly request cap.
+        if (etype.startswith("screen.") and not etype.startswith("screen.screenshot_")) or \
+                etype.startswith("playlist.") or etype.startswith("operation."):
             self.dirty.set()
         emit({"kind": "event", "type": etype, "resource": ev.get("resource"), "message": ev.get("message"),
               "at": ev.get("at")})
@@ -2815,6 +2922,8 @@ class Follower:
     def run(self):
         threading.Thread(target=self.snapshot_loop, daemon=True).start()
         threading.Thread(target=self.reviews_loop, daemon=True).start()
+        threading.Thread(target=self.control_loop, args=(sys.stdin,), daemon=True).start()
+        threading.Thread(target=self.shots_loop, daemon=True).start()
         self.dirty.set()
         self.stream()
 
