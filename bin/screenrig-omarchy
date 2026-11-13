@@ -2237,18 +2237,23 @@ def stop_processes(state):
             except OSError as err:
                 warn("could not end %s: %s" % (key, why(err)))
         return
-    if not cast_process(state, "owner_pid"):
-        return
-    pid = int(state["owner_pid"])
     try:
-        os.kill(pid, signal.SIGTERM)
-        deadline = time.monotonic() + 8
-        while cast_process(state, "owner_pid") and time.monotonic() < deadline:
-            time.sleep(0.05)
-        if cast_process(state, "owner_pid"):
-            os.killpg(pid, signal.SIGKILL)
+        # A handle on the process itself: once it is shown to be the cast's owner, the signals go to that
+        # process and to no other that might be given its number.
+        owner = os.pidfd_open(int(state.get("owner_pid") or 0))
+    except (OSError, ValueError):
+        return  # gone
+    try:
+        if not cast_process(state, "owner_pid"):
+            return
+        signal.pidfd_send_signal(owner, signal.SIGTERM)
+        if not select.select([owner], [], [], 8)[0]:
+            signal.pidfd_send_signal(owner, signal.SIGKILL)  # its children die with it
+            select.select([owner], [], [], 2)
     except OSError as err:
         warn("could not end the live cast's process: %s" % why(err))
+    finally:
+        os.close(owner)
 
 
 def finish_cast(state):
@@ -2761,8 +2766,11 @@ def main(argv):
         elif cmd == "agent-send":
             try:
                 # The panel passes the message in the environment, which other accounts cannot read. A
-                # panel still running from before an update passes it as arguments.
-                return agent_send(os.environ.pop("SCREENRIG_AGENT_MESSAGE", "") or " ".join(args))
+                # panel loaded before the update still passes it as an argument, where they can: that is
+                # refused, so it is not there for the length of a turn, and the panel is reloaded.
+                if args:
+                    raise Problem("The screenRIG panel was updated. Run omarchy-restart-shell, then send again.")
+                return agent_send(os.environ.pop("SCREENRIG_AGENT_MESSAGE", ""))
             except Problem as err:
                 emit({"kind": "error", "text": str(err)})
                 emit({"kind": "done", "ok": False})

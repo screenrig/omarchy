@@ -254,6 +254,20 @@ class AgentEvents(unittest.TestCase):
             self.assertEqual((seen["stdin"], seen["file"], seen["mode"]), (text, text, 0o600))
             self.assertFalse(seen["left"], "the message file goes when the turn ends")
 
+    def test_a_message_passed_as_an_argument_is_refused_and_never_reaches_an_agent(self):
+        # A panel loaded before the update passes it that way, where every account can read it.
+        out = io.StringIO()
+        with mock.patch.object(helper, "agent_send") as send, mock.patch.object(helper.sys, "stdout", out):
+            self.assertEqual(helper.main(["agent-send", "the door code is 4471"]), 1)
+        send.assert_not_called()
+        self.assertIn("omarchy-restart-shell", out.getvalue())
+        self.assertNotIn("4471", out.getvalue())
+        with mock.patch.object(helper, "agent_send", return_value=0) as send, \
+                mock.patch.dict(os.environ, {"SCREENRIG_AGENT_MESSAGE": "the door code is 4471"}):
+            self.assertEqual(helper.main(["agent-send"]), 0)
+            self.assertNotIn("SCREENRIG_AGENT_MESSAGE", os.environ, "the agent and its tools do not inherit it")
+        send.assert_called_once_with("the door code is 4471")
+
     def test_the_agents_brief_holds_nothing_from_the_project(self):
         # A project or organization name is chosen by its administrator; in the brief it would be instructions.
         tmp = tempfile.TemporaryDirectory()
