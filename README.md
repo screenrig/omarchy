@@ -133,9 +133,10 @@ run `screenrig-omarchy setup` to do that at once.
 
 Another account on the same machine can still make a cast fail, by holding
 port 8554 first; it cannot publish to the cast or read it. A
-`gpu-screen-recorder` installed with file capabilities hides its open files,
-so its connection cannot be recognised and the plugin refuses to cast (the
-Arch package installs it without them).
+`gpu-screen-recorder` installed with file capabilities or setuid is refused
+before it is started: the kernel would not end it with the cast, and it
+hides the open files by which its connection is recognised (the Arch package
+installs it with neither).
 
 The stream is RTSP over TCP with a login and is not encrypted. Whoever can
 intercept traffic between this machine and a screen on your network (ARP

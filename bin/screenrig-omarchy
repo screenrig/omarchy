@@ -24,6 +24,7 @@ import select
 import shutil
 import signal
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -1928,6 +1929,28 @@ OWNER_ENDINGS = {
 }
 
 
+def recorder_program():
+    """The recorder a cast may run, as a full path. One that gains privileges when it starts (file
+    capabilities, setuid, setgid) is refused before anything is started: the kernel then drops the tie that
+    ends it with the cast's owner, and hides the open files by which its connection is recognised."""
+    path = shutil.which("gpu-screen-recorder")
+    if not path:
+        raise Problem("Live casting needs gpu-screen-recorder, which is not installed.")
+    path = os.path.realpath(path)
+    try:
+        privileged = bool(os.stat(path).st_mode & (stat.S_ISUID | stat.S_ISGID))
+        try:
+            privileged = privileged or bool(os.getxattr(path, "security.capability"))
+        except OSError:
+            pass  # no such attribute: no file capabilities
+    except OSError as err:
+        raise Problem("gpu-screen-recorder cannot be read: %s" % why(err))
+    if privileged:
+        raise Problem("gpu-screen-recorder is installed with file capabilities or setuid, so the plugin cannot "
+                      "keep it tied to the cast or tell its stream from another program's. Nothing was cast.")
+    return path
+
+
 def span(value, least=0.0):
     """A length of time in seconds from a message, or ValueError: a number that is not one (NaN, infinity,
     a negative) would compare as a limit that never passes."""
@@ -1992,9 +2015,10 @@ def live_capture(recorder_args):
     gate.bind(("127.0.0.1", 0))
     gate.listen(8)
     try:
-        recorder = child(["gpu-screen-recorder"] + list(recorder_args)
+        # Checked again here, in the process that runs it, and run by the path that was checked.
+        recorder = child([recorder_program()] + list(recorder_args)
                          + ["-o", "rtsp://127.0.0.1:%d/live" % gate.getsockname()[1]])
-    except OSError as err:
+    except (OSError, Problem) as err:
         warn("gpu-screen-recorder did not start: %s" % why(err))
         end_children(children)
         return 1
@@ -2025,6 +2049,8 @@ def live_capture(recorder_args):
                 raise ValueError("not live")
         except (OSError, ValueError, KeyError, TypeError):
             return end("abandoned")  # live_start is gone, or failed before a screen showed the cast
+        if ended.is_set():
+            return  # it was already ending: a cast that began to end before it was live never was
         live.update(on=True, start_by=None)
         if seconds <= 0:
             keep_lease(generation, ended, end)
@@ -2160,8 +2186,7 @@ def await_server(server, log):
 def live_start(source, screens, minutes, label):
     if not screens:
         raise Problem("Pick at least one screen on this network.")
-    if not shutil.which("gpu-screen-recorder"):
-        raise Problem("Live casting needs gpu-screen-recorder, which is not installed.")
+    recorder_program()  # refuses now, before anything is started, what the owner would refuse
     if source == "window":
         # The desktop's own screen-share picker asks which window, as it does for any other app.
         capture = ["-w", "portal", "-restore-portal-session", "no"]

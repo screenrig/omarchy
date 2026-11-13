@@ -552,6 +552,37 @@ class CaptureGate(unittest.TestCase):
             self.addCleanup(sock.close)
             self.assertTrue(ended.wait(5))
 
+    def test_a_recorder_that_gains_privileges_when_it_starts_is_not_one_a_cast_may_run(self):
+        # Such a program is no longer ended with the cast's owner, and hides its open files.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        program = os.path.join(tmp.name, "gpu-screen-recorder")
+        with open(program, "w") as f:
+            f.write("#!/bin/sh\n")
+        os.chmod(program, 0o755)
+        with mock.patch.object(helper.shutil, "which", return_value=program):
+            self.assertEqual(helper.recorder_program(), os.path.realpath(program))
+            for mode in (0o4755, 0o2755):
+                os.chmod(program, mode)
+                with self.assertRaises(helper.Problem) as raised:
+                    helper.recorder_program()
+                self.assertIn("setuid", str(raised.exception))
+            os.chmod(program, 0o755)
+            with mock.patch.object(helper.os, "getxattr", return_value=b"\x01\x00\x00\x02") as asked, \
+                    self.assertRaises(helper.Problem) as raised:
+                helper.recorder_program()
+            asked.assert_called_once_with(os.path.realpath(program), "security.capability")
+            self.assertIn("file capabilities", str(raised.exception))
+            # A link to it is judged by what it points at.
+            link = os.path.join(tmp.name, "link")
+            os.symlink(program, link)
+            os.chmod(program, 0o4755)
+            with mock.patch.object(helper.shutil, "which", return_value=link), self.assertRaises(helper.Problem):
+                helper.recorder_program()
+        with mock.patch.object(helper.shutil, "which", return_value=None), self.assertRaises(helper.Problem) as raised:
+            helper.recorder_program()
+        self.assertIn("not installed", str(raised.exception))
+
     def test_the_gate_lets_nobody_in_when_the_recorder_hides_its_sockets(self):
         with mock.patch.object(helper, "sockets_hidden", return_value=True), mock.patch.object(helper, "warn"):
             port, ended, unchecked = self.gate(1, os.getpid())
@@ -829,6 +860,15 @@ with open(os.environ["TRIAL"] + "/notices", "a") as f:
         with open(os.path.join(self.live, "live.json")) as f:
             self.assertEqual(json.load(f)["generation"], "g2")
 
+    def test_the_owner_never_starts_a_recorder_that_gains_privileges(self):
+        os.chmod(os.path.join(self.root, "bin", "gpu-screen-recorder"), 0o4755)
+        proc, answer = self.owner()
+        self.assertIn("server_pid", answer)
+        self.assertEqual(proc.wait(timeout=10), 1)
+        self.assertGone([answer["server_pid"]])
+        self.assertEqual(self.read("recorder.argv"), b"", "the recorder was never started")
+        self.assertIn(b"file capabilities or setuid", self.read("owner.log"))
+
     def test_a_port_that_another_program_holds_is_said_and_nothing_is_captured(self):
         holder = socket.socket()
         holder.bind(("127.0.0.1", self.port))
@@ -941,7 +981,7 @@ class LiveCastStart(unittest.TestCase):
             mock.patch.object(helper, "wait_for_stream",
                               lambda url, seconds, recorder, server: self.probed.append(url) or self.waits.append(seconds) or True),
             mock.patch.object(helper, "port_owner_is", return_value=True),
-            mock.patch.object(helper.shutil, "which", lambda name: "/usr/bin/" + name),
+            mock.patch.object(helper, "recorder_program", return_value="/usr/bin/gpu-screen-recorder"),
             mock.patch.object(helper.time, "sleep"),
             mock.patch.object(helper.subprocess, "run",
                               return_value=subprocess.CompletedProcess([], 0, "", "")),
@@ -1171,11 +1211,15 @@ class LiveCastStart(unittest.TestCase):
         self.assertIn("file capabilities", str(raised.exception))
         self.assertEqual(self.cleared(), [])
 
-    def test_missing_recorder_is_said_before_anything_starts(self):
-        with mock.patch.object(helper.shutil, "which", return_value=None), self.assertRaises(helper.Problem) as raised:
-            self.start()
-        self.assertIn("gpu-screen-recorder", str(raised.exception))
-        self.assertEqual(self.children, [])
+    def test_a_missing_or_privileged_recorder_is_refused_before_anything_starts(self):
+        for problem in ("Live casting needs gpu-screen-recorder, which is not installed.",
+                        "gpu-screen-recorder is installed with file capabilities or setuid"):
+            with mock.patch.object(helper, "recorder_program", side_effect=helper.Problem(problem)), \
+                    self.assertRaises(helper.Problem) as raised:
+                self.start()
+            self.assertIn(problem, str(raised.exception))
+            self.assertEqual(self.children, [])
+            self.assertFalse(os.path.exists(self.live_file("live.json")))
 
     def test_login_is_kept_only_in_the_private_state_until_the_cast_ends(self):
         self.start()
