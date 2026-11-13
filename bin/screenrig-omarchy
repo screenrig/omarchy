@@ -2764,8 +2764,9 @@ class Follower:
             pass
         finally:
             emit({"kind": "shooting", "id": ""})
-        self.shot_next = time.time() + hold
-        return hold
+        # A press while this capture ran may already hold the next one longer.
+        self.shot_next = max(self.shot_next, time.time() + hold)
+        return self.shot_next - time.time()
 
     def shots_loop(self):
         while True:
@@ -2792,6 +2793,8 @@ class Follower:
                                                shot_mtime=int(os.path.getmtime(shot_path(s["id"])))
                                                if os.path.exists(shot_path(s["id"])) else 0)
                                           for s in self.snap["screens"]]))
+            # A screen paired or back online since need not wait out the rotation's sleep.
+            self.shots_wake.set()
         except Problem as err:
             emit({"kind": "status", "ok": False, "error": str(err)})
 

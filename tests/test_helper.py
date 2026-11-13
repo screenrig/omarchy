@@ -1923,6 +1923,19 @@ class ShotRotation(unittest.TestCase):
         self.turns(helper.SHOT_MIN_AGE_S - 1)
         self.assertEqual(self.asked(), ["scr_A", "scr_C"])
 
+    def test_a_press_during_a_capture_keeps_its_hold(self):
+        self.follower.shown = True
+        press = lambda *a, **k: self.follower.control_loop(iter(["shown\n", "shot scr_C\n", "shown\n"]))
+        with mock.patch.object(helper, "fetch_shot", side_effect=press):
+            wait = self.follower.shot_turn()
+        self.assertGreaterEqual(wait, helper.SHOT_WAIT_S - 1)
+
+    def test_a_new_snapshot_wakes_the_rotation(self):
+        with mock.patch.object(helper, "snapshot", return_value={"screens": [], "credits": {}}), \
+             mock.patch.object(helper, "menu_sync"):
+            self.follower.refresh()
+        self.assertTrue(self.follower.shots_wake.is_set())
+
     def test_someone_else_s_capture_is_never_replaced(self):
         self.others["scr_B"] = {"state": "pending", "capture_id": "cap_theirs"}
         self.others["scr_A"] = {"state": "ready", "capture_id": "cap_recent", "captured_at": self.iso(self.clock[0] - 30)}
