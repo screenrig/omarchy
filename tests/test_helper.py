@@ -782,6 +782,31 @@ with open(os.environ["TRIAL"] + "/notices", "a") as f:
         self.assertEqual(proc.wait(timeout=10), 1)
         self.assertGone(children)
 
+    def test_a_time_that_is_not_a_time_ends_the_cast_instead_of_never_passing(self):
+        for bad in (float("nan"), float("inf"), -1, "soon", None):
+            with self.assertRaises((ValueError, TypeError)):
+                helper.span(bad)
+        self.assertEqual((helper.span(0), helper.span("2.5"), helper.span(1, 1)), (0, 2.5, 1))
+        with self.assertRaises(ValueError):
+            helper.span(0, 1)
+        # Told to the running owner: no limit that never passes, and no cast "until stopped" by accident.
+        for word in ('{"seconds": 0, "placing": NaN}', '{"seconds": -1, "placing": 60}', '{"seconds": NaN, "placing": 60}',
+                     '{"seconds": Infinity, "placing": 60}'):
+            for name in ("config.got", "recorder.argv"):
+                if os.path.exists(os.path.join(self.root, name)):
+                    os.remove(os.path.join(self.root, name))
+            proc, children = self.publishing()
+            proc.stdin.write(word + "\n" + json.dumps({"live": True}) + "\n")
+            proc.stdin.flush()
+            self.assertEqual(proc.wait(timeout=10), 1, word)
+            self.assertGone(children)
+        os.remove(os.path.join(self.root, "recorder.argv"))
+        self.startup = float("inf")
+        proc, answer = self.owner()
+        self.assertEqual(answer, {})
+        self.assertNotEqual(proc.wait(timeout=10), 0)
+        self.assertEqual(self.read("recorder.argv"), b"", "nothing was started")
+
     def test_the_server_and_the_recorder_die_with_an_owner_that_is_killed(self):
         proc, children = self.publishing()
         self.go_live(proc, 0)

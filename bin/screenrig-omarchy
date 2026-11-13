@@ -15,6 +15,7 @@ import hashlib
 import http.client
 import ipaddress
 import json
+import math
 import mimetypes
 import os
 import re
@@ -1927,6 +1928,15 @@ OWNER_ENDINGS = {
 }
 
 
+def span(value, least=0.0):
+    """A length of time in seconds from a message, or ValueError: a number that is not one (NaN, infinity,
+    a negative) would compare as a limit that never passes."""
+    seconds = float(value)
+    if not math.isfinite(seconds) or seconds < least:
+        raise ValueError("not a length of time: %r" % (value,))
+    return seconds
+
+
 def live_capture(recorder_args):
     """The one process a cast lives in. It starts the stream server and the recorder as its children, which
     the kernel ends with it (PR_SET_PDEATHSIG) however it dies, so neither can outlive it. It is the gate
@@ -1938,6 +1948,7 @@ def live_capture(recorder_args):
     and for how long. If that second message never comes, the cast ends."""
     told = json.loads(sys.stdin.readline())
     generation = told["generation"]
+    startup = span(told["startup"], 1)
     login = base64.b64encode(("%s:%s" % tuple(told["login"])).encode())
     prctl = ctypes.CDLL(None).prctl
     ended = threading.Event()
@@ -2000,15 +2011,15 @@ def live_capture(recorder_args):
     except OSError:
         sleep_monitor = None
     # Until screens show the cast it has a time by which the next word from live_start must come.
-    live = {"start_by": time.monotonic() + float(told["startup"])}
+    live = {"start_by": time.monotonic() + startup}
 
     def hear_live_start():
         try:
             # The stream is up. From now the cast's own time runs, whatever the rest of the start does.
             word = json.loads(sys.stdin.readline())
-            seconds = float(word["seconds"])
+            seconds = span(word["seconds"])  # 0: until stopped
             live.update(deadline=time.monotonic() + seconds if seconds > 0 else None,
-                        start_by=time.monotonic() + float(word["placing"]))
+                        start_by=time.monotonic() + span(word["placing"], 1))
             # Screens show it.
             if json.loads(sys.stdin.readline())["live"] is not True:
                 raise ValueError("not live")
