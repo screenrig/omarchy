@@ -91,17 +91,40 @@ run `screenrig-omarchy setup` to do that at once.
 - The screenRIG agent plugin and its bundled CLI (Node.js), signed in: the first-run card installs both.
 - `grim`, `slurp`, `wl-clipboard`, `zenity` for captures, the clipboard and
   files.
-- Live casting: `gpu-screen-recorder` and `ffmpeg`. On the first cast the
+- Live casting: `gpu-screen-recorder`. On the first cast the
   plugin downloads [mediamtx](https://github.com/bluenviron/mediamtx) v1.21.3,
   checks it against the SHA-256 pinned in the plugin's source and keeps it in
-  `~/.local/share/screenrig-omarchy/bin`; it serves RTSP over TCP on port 8554.
-  Each cast has its own random login, which the screens receive in the stream
-  address, and a second one that publishing needs, used only by the capture
-  on this laptop. Screens reach it on the same
-  network: Android and Linux Players.
+  `~/.local/share/screenrig-omarchy/bin`; it serves RTSP over TCP on port 8554
+  and nothing else. Screens reach it on the same network: Android and Linux
+  Players. See [How a live cast is guarded](#how-a-live-cast-is-guarded).
 - Agent: Claude Code, Codex or Grok with the screenRIG plugin. The panel
   detects installed integrations and prefers your Omarchy default agent
   (`omarchy default agent`).
+
+## How a live cast is guarded
+
+- **Reading** the stream takes a random login made for that cast. The screens
+  receive it in the stream address, the plugin keeps it in a file only you
+  can read, and it ends with the cast.
+- **Publishing** takes a second random login, which exists only in the
+  plugin's memory: on no command line, in no environment and in no file (the
+  stream server's configuration holds its SHA-256). `gpu-screen-recorder`
+  takes its address on its command line, which every account on the machine
+  can read, so the plugin gives it an address with no login: a loopback port
+  of the plugin's capture process. That port lets in one connection, the
+  recorder's own, which it recognises by finding the connection's socket
+  among the recorder's open files in `/proc`; any other connection is closed
+  unread. The plugin adds the login on the way to the stream server and
+  closes the port once the recorder is in.
+- **Port 8554.** Before anything is sent there (the picture, or either login)
+  the plugin checks that its own stream server is the only program listening
+  on the port, and it stops the cast if that changes.
+
+Another account on the same machine can still make a cast fail, by holding
+port 8554 first; it cannot publish to the cast or read it. A
+`gpu-screen-recorder` installed with file capabilities hides its open files,
+so its connection cannot be recognised and the plugin refuses to cast (the
+Arch package installs it without them).
 
 ## Keybindings
 

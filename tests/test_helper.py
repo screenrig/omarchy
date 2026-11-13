@@ -912,15 +912,18 @@ class LiveCastStart(unittest.TestCase):
         self.assertNotIn("url", helper.live_status())
         self.assertNotIn(password, json.dumps(helper.live_status()))
 
-        def holders():
+        def holders(secret=password):
             found = []
             for top, _, names in os.walk(self.tmp.name):
                 for name in names:
                     with open(os.path.join(top, name), "rb") as f:
-                        if password.encode() in f.read():
+                        if secret.encode() in f.read():
                             found.append(name)
             return found
         self.assertEqual(holders(), ["live.json"])
+        # The publishing login is in no file at all: not the state, the server's config or a log.
+        publisher = json.loads(self.told[0])["login"]
+        self.assertEqual([holders(part) for part in publisher], [[], []])
         helper.live_stop()
         self.assertEqual(holders(), [])
         self.assertIn(("DELETE", "/api/playlists/pl_cast", None), self.calls)
