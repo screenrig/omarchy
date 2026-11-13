@@ -477,6 +477,7 @@ class CaptureGate(unittest.TestCase):
         got, reached = self.relay([b"ANNOUNCE rtsp://x/live RTSP/1.0\r\nContent-Length: 10\r\n\r\nabc"])
         self.assertEqual((got, reached), (b"", False))
         for bad in (b"ANNOUNCE rtsp://x/live RTSP/1.0\r\nContent-Length: -1\r\n\r\n",
+                    b"ANNOUNCE rtsp://x/live RTSP/1.0\r\nContent-Length: " + b"9" * 5000 + b"\r\n\r\n",
                     b"ANNOUNCE rtsp://x/live RTSP/1.0\r\nContent-Length: %d\r\n\r\n" % (helper.GATE_BODY_MAX + 1),
                     b"OPTIONS rtsp://x/live RTSP/1.0\r\nX: " + b"a" * helper.GATE_HEAD_MAX):
             with self.assertRaises(OSError):

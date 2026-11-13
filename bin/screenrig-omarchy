@@ -1338,7 +1338,7 @@ def mediamtx_config(user, password, publisher):
     os.makedirs(LIVE_DIR, mode=0o700, exist_ok=True)
     path = os.path.join(LIVE_DIR, "mediamtx.yml")
     write_private(path, (
-        "logLevel: info\n"
+        "logLevel: warn\n"
         "api: no\nmetrics: no\npprof: no\nplayback: no\n"
         "rtsp: yes\nrtspAddress: :%d\nrtspTransports: [tcp]\nrtspEncryption: \"no\"\nrtspAuthMethods: [basic]\n"
         "rtmp: no\n"
@@ -1771,6 +1771,7 @@ def peer_is(conn, pid):
 SERVER_ACCEPT_TRIES = 20  # a second, in twentieths
 TCP_HOLDS_ADDRESSES = (1, 8)  # tcpi_state, the first byte of TCP_INFO: established, or the peer sent its last byte
 CAPTURE_UNCHECKED = 3  # live-capture's exit status when the recorder's sockets could not be read
+GATE_WARNINGS = 5
 GATE_HEAD_MAX = 64 * 1024
 GATE_BODY_MAX = 1024 * 1024
 
@@ -1805,7 +1806,7 @@ def add_login(conn, upstream, login):
         for field in headers if found else ():
             name, _, value = field.partition(b":")
             if name.strip().lower() == b"content-length":
-                if not value.strip().isdigit():
+                if not value.strip().isdigit() or len(value.strip()) > 9:
                     raise OSError("the recorder sent a request with no usable length")
                 size = int(value)
         if size > GATE_BODY_MAX or len(head) > GATE_HEAD_MAX:
@@ -1875,6 +1876,7 @@ def serve_gate(gate, recorder_pid, server_pid, login, done, unchecked):
     before a byte of it is read. A cast is one connection: the recorder does not publish a second time, so
     the port closes once the recorder is in and the login is used once."""
     conn = None
+    refused = 0
     try:
         with gate:
             while conn is None:
@@ -1885,7 +1887,10 @@ def serve_gate(gate, recorder_pid, server_pid, login, done, unchecked):
                     conn = candidate
                 else:
                     close_socket(candidate)
-                    warn("closed a connection to the capture port that is not the recorder's")
+                    refused += 1
+                    if refused <= GATE_WARNINGS:  # a program that keeps knocking does not fill the log
+                        warn("closed a connection to the capture port that is not the recorder's"
+                             + (" (further ones are not logged)" if refused == GATE_WARNINGS else ""))
                     if sockets_hidden(recorder_pid):
                         # No connection can be shown to be the recorder's, so none is let in.
                         warn("the recorder's sockets cannot be read, so its connection cannot be checked")
@@ -1943,10 +1948,18 @@ def live_capture(recorder_args):
             why_ended.append(reason)
         ended.set()
 
+    owner_pid = os.getpid()
+
+    def tied_to_owner():
+        # In the child, before it runs anything: PR_SET_PDEATHSIG, so the kernel ends it when the owner
+        # dies. An owner that died before this line would never be noticed, so the child leaves at once.
+        if prctl(1, signal.SIGKILL) != 0 or os.getppid() != owner_pid:
+            os._exit(1)
+
     def child(cmd, **kw):
-        # PR_SET_PDEATHSIG. Started from this, the main thread: the kernel ties the signal to the thread
-        # that forked, and this one lives as long as the process.
-        return subprocess.Popen(cmd, stdin=subprocess.DEVNULL, preexec_fn=lambda: prctl(1, signal.SIGKILL), **kw)
+        # Started from this, the main thread: the kernel ties the signal to the thread that forked, and
+        # this one lives as long as the process.
+        return subprocess.Popen(cmd, stdin=subprocess.DEVNULL, preexec_fn=tied_to_owner, **kw)
 
     # Handlers, not SIG_IGN, which the children would inherit.
     signal.signal(signal.SIGINT, lambda *_: None)
