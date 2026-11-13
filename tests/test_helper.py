@@ -1415,6 +1415,22 @@ class LiveCastStart(unittest.TestCase):
             self.assertFalse(helper.legacy_process(dict(legacy, recorder_pid=pid), "recorder_pid"))
             helper.stop_processes(dict(legacy, recorder_pid=pid))
         self.assertEqual((bystander.poll(), recording.poll()), (None, None))
+        # The old keep-alive is known by its whole command line, alone or under systemd-inhibit.
+        script = os.path.realpath(os.path.join(HERE, "..", "bin", "screenrig-omarchy"))
+        inhibit = ["systemd-inhibit", "--what=sleep:shutdown", "--mode=delay", "--who=screenRIG",
+                   "--why=Stop the live cast before sleeping"]
+        for argv, known in (([sys.executable, script, "live-keepalive"], True),
+                            (inhibit + [sys.executable, script, "live-keepalive"], True),
+                            ([sys.executable, "-I", "-c", "pass", script, "live-keepalive"], False),
+                            (["sleep", "60", script, "live-keepalive"], False),
+                            (inhibit + ["sleep", "infinity"], False)):
+            with mock.patch("builtins.open", mock.mock_open(read_data="\0".join(argv).encode() + b"\0")):
+                self.assertIs(helper.legacy_process({"keepalive_pid": 1}, "keepalive_pid"), known, argv)
+        sleeper = self.real_popen([sys.executable, "-I", "-c", "import time; time.sleep(60)", script, "live-keepalive"])
+        self.addCleanup(sleeper.wait)
+        self.addCleanup(sleeper.kill)
+        helper.stop_processes({"keepalive_pid": sleeper.pid})
+        self.assertIsNone(sleeper.poll(), "a program that only ends with the keep-alive's words is left alone")
         self.assertFalse(helper.live_status()["live"])  # the pid recorded for its server runs something else
         self.assertEqual(helper.live_stop(), "Live cast stopped")
         self.assertIsNotNone(old_recorder.wait(timeout=5))

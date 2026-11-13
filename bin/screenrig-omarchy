@@ -2274,7 +2274,16 @@ def legacy_process(state, key):
                 and re.fullmatch(r"rtsp://(\S+@)?127\.0\.0\.1:%d/live" % LIVE_PORT, args[-1]) is not None)
     if key == "server_pid":
         return args == [os.path.join(LIVE_BIN, "mediamtx"), os.path.join(LIVE_DIR, "mediamtx.yml")]
-    return key == "keepalive_pid" and args[-2:] == [os.path.realpath(__file__), "live-keepalive"]
+    if key == "keepalive_pid":
+        # The whole command line as those versions ran it: Python on this helper, alone or under
+        # systemd-inhibit. A program that merely ends with the same words is not it.
+        inhibit = ["systemd-inhibit", "--what=sleep:shutdown", "--mode=delay", "--who=screenRIG",
+                   "--why=Stop the live cast before sleeping"]
+        if [os.path.basename(args[0])] + args[1:5] == inhibit:
+            args = args[5:]
+        return (len(args) == 3 and os.path.basename(args[0]).startswith("python")
+                and args[1:] == [os.path.realpath(__file__), "live-keepalive"])
+    return False
 
 
 def signal_process(pid, is_it, sig):
