@@ -1047,6 +1047,17 @@ class LiveCastStart(unittest.TestCase):
         self.assertEqual(self.cleared(), ["scr_A"])
         self.assertIn("Another program", helper.notify.call_args[0][1])
 
+    def test_keepalive_keeps_a_cast_whose_port_table_could_not_be_read_once(self):
+        self.start(screens=("scr_A",))
+
+        class Stop(Exception):
+            pass
+        with mock.patch.object(helper, "port_owner_is", side_effect=[False, True]) as owner, self.assertRaises(Stop):
+            helper.keep_alive_loop(self.live_file("live.json"), mock.Mock(wait=mock.Mock(side_effect=[False, Stop])))
+        self.assertEqual(owner.call_count, 2)
+        self.assertTrue(os.path.exists(self.live_file("live.json")))
+        helper.live_stop()
+
     def test_capture_and_server_end_before_the_api_is_asked_anything(self):
         self.start()
         self.calls.clear()

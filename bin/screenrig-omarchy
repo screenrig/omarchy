@@ -1960,8 +1960,9 @@ def keep_alive_loop(path, stop_now):
             live_stop()
             notify("Live cast stopped", "The capture ended, so the screens went back to their own content.", "normal")
             return 0
-        if not port_owner_is(state.get("server_pid"), LIVE_PORT):
+        if not (port_owner_is(state.get("server_pid"), LIVE_PORT) or port_owner_is(state.get("server_pid"), LIVE_PORT)):
             # The screens hold the stream's address and its login; they must not reach another program there.
+            # Read twice: one unreadable table must not end a healthy cast.
             live_stop()
             notify("Live cast stopped", "Another program is listening on the stream's port, so the cast ended.", "normal")
             return 0

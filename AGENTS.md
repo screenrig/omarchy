@@ -16,9 +16,9 @@ Rules:
 - A window cast goes through the desktop's screen-share picker. Never answer
   the portal for the person or set `custom_picker_binary`: a picker cannot
   tell which app is asking.
-- No login, token or code on a command line or in a child's environment:
-  every account on the machine can read the first. The recorder publishes
-  through `live-capture`'s loopback gate, which holds the publishing login.
+- Never put a login or token on a command line: every account on the
+  machine can read it. The recorder publishes through `live-capture`'s
+  loopback gate, which holds the publishing login.
 - Nothing goes to TCP 8554 unless `port_owner_is` says the cast's own
   mediamtx is the only listener.
 - Gate: `python3 -m unittest discover -s tests` and `omarchy plugin validate .`.
