@@ -2770,7 +2770,11 @@ class Follower:
 
     def shots_loop(self):
         while True:
-            wait = self.shot_turn()
+            try:
+                wait = self.shot_turn()
+            except Exception as err:  # a renewal that hangs, say: one turn lost, never the rotation
+                warn("screenshot rotation: %s" % why(err))
+                wait = SHOT_GAP_S
             self.shots_wake.wait(timeout=wait)
             self.shots_wake.clear()
 

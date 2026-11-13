@@ -1930,6 +1930,17 @@ class ShotRotation(unittest.TestCase):
             wait = self.follower.shot_turn()
         self.assertGreaterEqual(wait, helper.SHOT_WAIT_S - 1)
 
+    def test_an_unexpected_failure_costs_one_turn_not_the_rotation(self):
+        self.follower.shown = True
+        hung = subprocess.TimeoutExpired(["screenrig", "billing", "balance"], 60)
+        self.follower.shots_wake = mock.Mock(wait=mock.Mock(side_effect=[True, Stop]))
+        with mock.patch.object(self.follower, "shot_turn", side_effect=[hung, 10]), \
+             mock.patch.object(helper, "warn") as warned, self.assertRaises(Stop):
+            self.follower.shots_loop()
+        self.assertEqual(self.follower.shots_wake.wait.call_args_list, [mock.call(timeout=helper.SHOT_GAP_S),
+                                                                        mock.call(timeout=10)])
+        warned.assert_called_once()
+
     def test_a_new_snapshot_wakes_the_rotation(self):
         with mock.patch.object(helper, "snapshot", return_value={"screens": [], "credits": {}}), \
              mock.patch.object(helper, "menu_sync"):
