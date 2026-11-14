@@ -16,7 +16,7 @@ your coding agent to change what plays.
 ## What it does
 
 - **Bar chip**: the screenRIG mark in your bar, with a red dot when a screen
-  drops, credits run low or a cast is live. Click for the panel, right-click to
+  drops or a cast is live. Click for the panel, right-click to
   cast a region capture, middle-click to stop a live cast.
 - **Screens**: every screen with its latest screenshot, what it plays and when
   it was last seen. While the panel shows your screens it asks them for fresh
@@ -32,10 +32,10 @@ your coding agent to change what plays.
   installed, then another installed integration.
 - **Project switcher**, a screenRIG section in the Omarchy menu with every
   screen and playlist searchable, and notifications when a screen goes offline
-  or comes back, credits run low, an ad booking needs review, or a live cast
-  starts or stops. Each one leaves by itself after a few seconds; only a
-  running live cast stays, with its Stop. The **Settings** tab turns each kind
-  on or off, and can add one for each time a screen starts showing new content.
+  or comes back, an ad booking needs review, or a live cast starts or stops.
+  Each one leaves by itself after a few seconds; only a running live cast
+  stays, with its Stop. The **Settings** tab turns each kind on or off, and
+  can add one for each time a screen starts showing new content.
 
 | Cast live | While casting | Agent |
 |---|---|---|

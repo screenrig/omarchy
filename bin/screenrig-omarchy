@@ -298,18 +298,6 @@ def project_id(cfg):
 
 # ---------------------------------------------------------------------- HTTP
 
-CREDITS = {}
-
-
-def _note_credits(headers):
-    low = headers.get("ScreenRig-Credits-Low")
-    if low is not None:
-        CREDITS["low"] = low == "true"
-        try:
-            CREDITS["remaining"] = int(headers.get("ScreenRig-Credits-Remaining") or 0)
-        except ValueError:
-            pass
-
 
 def error_body(err):
     """An HTTP error answer's body; empty when the connection dropped while it was read."""
@@ -379,7 +367,6 @@ def _send(method, path, body, raw, headers, _retried=False):
     req = urllib.request.Request(url, data=data, method=method, headers=h)
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
-            _note_credits(resp.headers)
             payload = resp.read()
             if raw:
                 return payload, resp.headers
@@ -488,7 +475,6 @@ def snapshot():
         "screens": screens,
         "playlists": [{"id": p["id"], "name": names[p["id"]], "approved": p.get("approved_revision") is not None}
                       for p in sorted(playlists, key=lambda p: names[p["id"]].lower())],
-        "credits": dict(CREDITS),
     }
 
 
@@ -524,7 +510,7 @@ def fetch_shot(screen_id, fresh=False):
 
 
 def fetch_all_shots(screens):
-    """Latest stored screenshots (credit-exempt) for screens whose copy is older than ten minutes."""
+    """Latest stored screenshots for screens whose copy is older than ten minutes."""
     for s in screens:
         path = shot_path(s["id"])
         if os.path.exists(path) and time.time() - os.path.getmtime(path) < 600:
@@ -1254,7 +1240,7 @@ LIVE_PLATFORMS = ("android", "qt")
 LIVE_NOTICE = "Live cast"
 NOTICE_FRESH_S = 120    # an event older than this is history, not news
 # The notices the panel's Settings tab turns on and off, and whether each is on until the person chooses.
-NOTICES = {"offline": True, "online": True, "published": False, "credits": True, "reviews": True}
+NOTICES = {"offline": True, "online": True, "published": False, "reviews": True}
 # "Until I stop" casts hold a takeover lease the cast's owner renews; if the laptop
 # vanishes the lease runs out and the screens return to their own content.
 LIVE_LEASE_MIN = 75
@@ -2699,7 +2685,6 @@ class Follower:
         self.offline_notified = set()
         self.publish = {}
         self.publish_lock = threading.Lock()
-        self.credits_low = None
         self.seen_reviews = None
         # The screenshot rotation: whether the panel shows the screens, when each screen may be asked again for a
         # capture, and when the next capture may start (the gap, or the API's hold).
@@ -2795,12 +2780,6 @@ class Follower:
         try:
             self.snap = snapshot()
             emit(self.snap)
-            low = self.snap["credits"].get("low")
-            if low and self.credits_low is False and self.do_notify and notice_on("credits"):
-                notify("screenRIG credits are low", "%s credits left this month." % self.snap["credits"].get("remaining"),
-                       "normal", [("Billing", ["xdg-open", DASHBOARD + "/billing/settings"])], "󰄬")
-            if low is not None:
-                self.credits_low = low
             try:
                 menu_sync(self.snap)
             except OSError as err:

@@ -55,7 +55,6 @@ Item {
     { id: "online", on: true, label: "A screen comes back online", detail: "After an offline notice for that screen." },
     { id: "published", on: false, label: "A screen starts showing new content",
       detail: "Each time a playlist's screens take a new revision, whoever published it." },
-    { id: "credits", on: true, label: "Credits run low", detail: "Once, when the month's credits drop to the low mark." },
     { id: "reviews", on: true, label: "An ad booking needs your review", detail: "When a buyer submits creative for your screens." }
   ]
   property var notices: ({})
@@ -1007,11 +1006,6 @@ Item {
                   color: root.onlineColor
                   width: root.svc && root.svc.screens.length ? parent.width * root.presence * root.svc.onlineCount / root.svc.screens.length : 0
                 }
-              }
-              Label {
-                visible: !!root.svc && !!root.svc.credits && !!root.svc.credits.low
-                text: "· credits low"
-                color: Commons.Color.urgent
               }
               Item { Layout.fillWidth: true }
               Segmented {

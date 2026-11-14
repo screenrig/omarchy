@@ -1943,7 +1943,7 @@ class ShotRotation(unittest.TestCase):
         warned.assert_called_once()
 
     def test_a_new_snapshot_wakes_the_rotation(self):
-        with mock.patch.object(helper, "snapshot", return_value={"screens": [], "credits": {}}), \
+        with mock.patch.object(helper, "snapshot", return_value={"screens": []}), \
              mock.patch.object(helper, "menu_sync"):
             self.follower.refresh()
         self.assertTrue(self.follower.shots_wake.is_set())

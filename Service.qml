@@ -18,7 +18,6 @@ Item {
   property var screens: []
   property var playlists: []
   property var project: ({})
-  property var credits: ({})
   property bool ready: false
   property bool connected: false
   property string lastError: ""
@@ -286,7 +285,6 @@ Item {
       screens = msg.screens
       playlists = msg.playlists
       project = msg.project || {}
-      if (msg.credits) credits = msg.credits
       snapshotAt = msg.at * 1000
       droppedIds = dropped
       freshShots = ({})

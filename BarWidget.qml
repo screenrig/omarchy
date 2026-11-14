@@ -31,7 +31,6 @@ BarWidget {
     var dropped = svc.droppedNames()
     for (var i = 0; i < dropped.length; i++) lines.push(dropped[i] + " went offline")
     if (svc.live && svc.live.live) lines.push("Live: " + (svc.live.label || "Desktop") + " on " + (svc.live.screens || []).length + " screen(s) · middle-click to stop")
-    if (svc.credits && svc.credits.low) lines.push("Credits are low")
     if (!svc.connected && svc.lastError !== "") lines.push(svc.lastError)
     return lines.join("\n")
   }
@@ -44,7 +43,7 @@ BarWidget {
   }
 
   readonly property bool casting: !!svc && !!svc.live && !!svc.live.live
-  readonly property bool warn: alert || casting || (!!svc && !!svc.credits && !!svc.credits.low)
+  readonly property bool warn: alert || casting
 
   BarIconButton {
     id: button
@@ -68,7 +67,7 @@ BarWidget {
     foreground: root.bar ? root.bar.barForeground : Color.foreground
     tooltipText: root.tooltip()
 
-    // A screen dropped or credits are low: a red dot, the mark stays monochrome.
+    // A screen dropped or a cast is live: a red dot, the mark stays monochrome.
     Rectangle {
       visible: root.warn
       width: Style.space(6)
