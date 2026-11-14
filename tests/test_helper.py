@@ -2170,8 +2170,18 @@ class FollowerNotices(unittest.TestCase):
                       mock.patch.object(helper, "emit", lambda _: None)):
             patch.start()
             self.addCleanup(patch.stop)
+        self.state = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.state)
+        patch = mock.patch.object(helper, "STATE", self.state)
+        patch.start()
+        self.addCleanup(patch.stop)
         self.follower = helper.Follower(do_notify=True)
-        self.follower.snap = {"screens": [{"id": "scr_A", "label": "Lobby"}]}
+        self.follower.snap = {"screens": [{"id": "scr_A", "label": "Lobby", "playing_id": "pl_1"}],
+                              "playlists": [{"id": "pl_1", "name": "Menu"}]}
+
+    def choose(self, **notices):
+        with open(os.path.join(self.state, "notices.json"), "w") as f:
+            json.dump(notices, f)
 
     def event(self, etype, age=0, **details):
         at = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() - age)) + ".123Z"
@@ -2196,8 +2206,20 @@ class FollowerNotices(unittest.TestCase):
 
     def test_replayed_events_and_activated_revisions_say_nothing(self):
         self.event("screen.offline", age=3600)
-        self.event("screen.manifest_upgrade", state="current")
+        with mock.patch.object(helper.threading, "Timer") as timer:
+            self.event("screen.manifest_upgrade", state="current")
+        timer.assert_not_called()
         self.assertEqual(self.sent, [])
+
+    def test_the_persons_choices_turn_notices_off_and_on(self):
+        self.choose(offline=False, published=True)
+        self.event("screen.offline")
+        self.event("screen.online")
+        with mock.patch.object(helper.threading, "Timer") as timer:
+            self.event("screen.manifest_upgrade", state="current")
+        timer.assert_called_once()
+        self.follower.flush_publish("pl_1")
+        self.assertEqual([n[0] for n in self.sent], ["Lobby is back online", "Published: Menu"])
 
 
 if __name__ == "__main__":

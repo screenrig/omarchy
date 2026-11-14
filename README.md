@@ -34,7 +34,8 @@ your coding agent to change what plays.
   screen and playlist searchable, and notifications when a screen goes offline
   or comes back, credits run low, an ad booking needs review, or a live cast
   starts or stops. Each one leaves by itself after a few seconds; only a
-  running live cast stays, with its Stop.
+  running live cast stays, with its Stop. The **Settings** tab turns each kind
+  on or off, and can add one for each time a screen starts showing new content.
 
 | Cast live | While casting | Agent |
 |---|---|---|

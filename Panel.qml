@@ -49,6 +49,30 @@ Item {
       } catch (e) {}
     }
   }
+  // Which notices the person wants (the helper reads the same file; `on` is each one's default there).
+  readonly property var noticeKinds: [
+    { id: "offline", on: true, label: "A screen goes offline", detail: "Once per outage, with when it was last online." },
+    { id: "online", on: true, label: "A screen comes back online", detail: "After an offline notice for that screen." },
+    { id: "published", on: false, label: "A screen starts showing new content",
+      detail: "Each time a playlist's screens take a new revision, whoever published it." },
+    { id: "credits", on: true, label: "Credits run low", detail: "Once, when the month's credits drop to the low mark." },
+    { id: "reviews", on: true, label: "An ad booking needs your review", detail: "When a buyer submits creative for your screens." }
+  ]
+  property var notices: ({})
+  function noticeOn(kind) { return notices[kind.id] === undefined ? kind.on : !!notices[kind.id] }
+  function setNotice(kind, on) {
+    var next = Object.assign({}, notices)
+    next[kind.id] = on
+    notices = next
+    noticesFile.setText(JSON.stringify(next) + "\n")
+  }
+  FileView {
+    id: noticesFile
+    path: Quickshell.env("HOME") + "/.local/state/screenrig-omarchy/notices.json"
+    atomicWrites: true
+    printErrors: false
+    onLoaded: { try { root.notices = JSON.parse(String(text() || "{}")) || {} } catch (e) {} }
+  }
   property string focusId: ""
   property string screenFilter: "all"
   property string search: ""
@@ -159,7 +183,8 @@ Item {
   readonly property var tabs: [
     { id: "screens", label: "Screens", icon: "󰍹" },
     { id: "cast", label: "Cast", icon: "󰄘" },
-    { id: "agent", label: "Agent", icon: "󰚩" }
+    { id: "agent", label: "Agent", icon: "󰚩" },
+    { id: "settings", label: "Settings", icon: "󰒓" }
     // Player and Theme are hidden for now; their views below stay.
   ]
 
@@ -2421,6 +2446,43 @@ Item {
                   implicitHeight: root.controlHeight + Style.space(10)
                   iconText: "󰓛"; text: "Stop"
                   onClicked: root.svc.agentStop()
+                }
+              }
+            }
+
+            // ------------------------------------------------------- settings
+            View {
+              name: "settings"
+
+              Label { text: "Notifications"; title: true }
+              Label {
+                Layout.fillWidth: true
+                meta: true
+                wrapMode: Text.Wrap
+                text: "Each one leaves by itself after a few seconds. A running live cast always shows, with its Stop."
+              }
+              Repeater {
+                model: root.noticeKinds
+                delegate: ColumnLayout {
+                  required property var modelData
+                  required property int index
+                  Layout.fillWidth: true
+                  spacing: root.gap
+                  Hairline {}
+                  RowLayout {
+                    Layout.fillWidth: true
+                    spacing: Style.space(14)
+                    ColumnLayout {
+                      Layout.fillWidth: true
+                      spacing: Style.space(2)
+                      Label { text: modelData.label }
+                      Label { Layout.fillWidth: true; meta: true; wrapMode: Text.Wrap; text: modelData.detail }
+                    }
+                    ToggleSwitch {
+                      checked: root.noticeOn(modelData)
+                      onToggled: root.setNotice(modelData, !root.noticeOn(modelData))
+                    }
+                  }
                 }
               }
             }

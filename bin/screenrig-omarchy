@@ -682,6 +682,16 @@ def notify(title, body="", urgency="normal", actions=(), glyph="󰍹"):
         subprocess.Popen(["notify-send", "-a", "screenRIG", "-u", urgency, title, body])
 
 
+def notice_on(kind):
+    """Whether the person wants this notice: their choice in the panel's Settings, else its default."""
+    try:
+        with open(os.path.join(STATE, "notices.json"), encoding="utf-8") as f:
+            saved = json.load(f)
+        return bool(saved.get(kind, NOTICES[kind])) if isinstance(saved, dict) else NOTICES[kind]
+    except (OSError, ValueError):
+        return NOTICES[kind]
+
+
 def capture():
     os.makedirs(os.path.join(CACHE, "captures"), exist_ok=True)
     out = os.path.join(CACHE, "captures", time.strftime("capture-%Y%m%d-%H%M%S.png"))
@@ -1243,6 +1253,8 @@ LIVE_PORT = 8554
 LIVE_PLATFORMS = ("android", "qt")
 LIVE_NOTICE = "Live cast"
 NOTICE_FRESH_S = 120    # an event older than this is history, not news
+# The notices the panel's Settings tab turns on and off, and whether each is on until the person chooses.
+NOTICES = {"offline": True, "online": True, "published": False, "credits": True, "reviews": True}
 # "Until I stop" casts hold a takeover lease the cast's owner renews; if the laptop
 # vanishes the lease runs out and the screens return to their own content.
 LIVE_LEASE_MIN = 75
@@ -2685,6 +2697,8 @@ class Follower:
         self.dirty = threading.Event()
         self.snap = None
         self.offline_notified = set()
+        self.publish = {}
+        self.publish_lock = threading.Lock()
         self.credits_low = None
         self.seen_reviews = None
         # The screenshot rotation: whether the panel shows the screens, when each screen may be asked again for a
@@ -2782,7 +2796,7 @@ class Follower:
             self.snap = snapshot()
             emit(self.snap)
             low = self.snap["credits"].get("low")
-            if low and self.credits_low is False and self.do_notify:
+            if low and self.credits_low is False and self.do_notify and notice_on("credits"):
                 notify("screenRIG credits are low", "%s credits left this month." % self.snap["credits"].get("remaining"),
                        "normal", [("Billing", ["xdg-open", DASHBOARD + "/billing/settings"])], "󰄬")
             if low is not None:
@@ -2820,7 +2834,7 @@ class Follower:
                 cfg, _ = access_token()
                 items = api("GET", "/api/advertising/reviews?project=" + project_id(cfg)).get("items") or []
                 pending = {r["id"] for r in items if r.get("state") == "pending"}
-                if self.seen_reviews is not None and self.do_notify:
+                if self.seen_reviews is not None and self.do_notify and notice_on("reviews"):
                     for _ in pending - self.seen_reviews:
                         notify("An ad booking needs your review", "A buyer submitted creative for your screens.",
                                "normal", [("Review", ["xdg-open", DASHBOARD + "/advertising/seller-campaigns"])], "󰆼")
@@ -2835,6 +2849,14 @@ class Follower:
                 return s["label"]
         return fallback or sid
 
+    def flush_publish(self, playlist):
+        with self.publish_lock:
+            screens = self.publish.pop(playlist, set())
+        if screens:
+            name = next((p["name"] for p in (self.snap or {}).get("playlists", []) if p["id"] == playlist), "A playlist")
+            notify("Published: %s" % name, "Now showing on %d screen%s." % (len(screens), "" if len(screens) == 1 else "s"),
+                   "low", [("Open", ["xdg-open", "%s/playlists/%s" % (DASHBOARD, playlist)])], "󰄬")
+
     def on_event(self, ev):
         etype = ev.get("type", "")
         # A screenshot's events change nothing in the snapshot, whose reads count toward the hourly request cap.
@@ -2847,20 +2869,32 @@ class Follower:
         sid = res.get("id", "")
         # Each change is said once; what a screen is now is kept whether or not it is said.
         if etype == "screen.offline":
-            changed = sid not in self.offline_notified
+            changed, kind = sid not in self.offline_notified, "offline"
             self.offline_notified.add(sid)
         elif etype == "screen.online":
-            changed = sid in self.offline_notified
+            changed, kind = sid in self.offline_notified, "online"
             self.offline_notified.discard(sid)
+        elif etype == "screen.manifest_upgrade" and (ev.get("details") or {}).get("state") == "current":
+            changed, kind = True, "published"
         else:
             return
         # Only news: a stream that resumes after sleep replays what happened meanwhile.
         at = iso_time((ev.get("at") or "")[:19] + "Z")
-        if not changed or not self.do_notify or (at and time.time() - at > NOTICE_FRESH_S):
+        if not changed or not self.do_notify or (at and time.time() - at > NOTICE_FRESH_S) or not notice_on(kind):
             return
         name = self.screen_name(sid, res.get("name"))
-        if etype == "screen.online":
+        if kind == "online":
             notify("%s is back online" % name, "", "low", glyph="󰍹")
+            return
+        if kind == "published":
+            # A screen took a new revision, whoever published it; one notice for the screens of one playlist.
+            playlist = next((s.get("playing_id") for s in (self.snap or {}).get("screens", []) if s["id"] == sid), None)
+            if playlist:
+                with self.publish_lock:
+                    first = playlist not in self.publish
+                    self.publish.setdefault(playlist, set()).add(sid)
+                if first:
+                    threading.Timer(10, self.flush_publish, [playlist]).start()
             return
         payload = json.dumps({"mode": "screens", "focus": sid})
         last = iso_time(((ev.get("details") or {}).get("last_online_at") or "")[:19] + "Z")
