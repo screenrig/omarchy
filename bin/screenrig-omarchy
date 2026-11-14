@@ -2796,6 +2796,8 @@ class Follower:
                                                shot_mtime=int(os.path.getmtime(shot_path(s["id"])))
                                                if os.path.exists(shot_path(s["id"])) else 0)
                                           for s in self.snap["screens"]]))
+            # An online event the stream dropped must not hide the screen's next offline.
+            self.offline_notified -= {s["id"] for s in self.snap["screens"] if s.get("online")}
             # A screen paired or back online since need not wait out the rotation's sleep.
             self.shots_wake.set()
         except Problem as err:
@@ -2841,24 +2843,31 @@ class Follower:
             self.dirty.set()
         emit({"kind": "event", "type": etype, "resource": ev.get("resource"), "message": ev.get("message"),
               "at": ev.get("at")})
-        # Only news: a stream that resumes after sleep replays what happened meanwhile.
-        at = iso_time((ev.get("at") or "")[:19] + "Z")
-        if not self.do_notify or (at and time.time() - at > NOTICE_FRESH_S):
-            return
         res = ev.get("resource") or {}
         sid = res.get("id", "")
-        name = self.screen_name(sid, res.get("name"))
-        if etype == "screen.offline" and sid not in self.offline_notified:
+        # Each change is said once; what a screen is now is kept whether or not it is said.
+        if etype == "screen.offline":
+            changed = sid not in self.offline_notified
             self.offline_notified.add(sid)
-            payload = json.dumps({"mode": "screens", "focus": sid})
-            last = iso_time(((ev.get("details") or {}).get("last_online_at") or "")[:19] + "Z")
-            notify("%s went offline" % name, time.strftime("Last online %H:%M.", time.localtime(last)) if last else "",
-                   "normal", [("Open", ["omarchy-shell", "shell", "summon", PLUGIN_ID, payload]),
-                              ("Reload", ["screenrig-omarchy", "act", sid, "reload", "--notify"]),
-                              ("Dashboard", ["xdg-open", "%s/screens/%s" % (DASHBOARD, sid)])], "󰍹")
-        elif etype == "screen.online" and sid in self.offline_notified:
+        elif etype == "screen.online":
+            changed = sid in self.offline_notified
             self.offline_notified.discard(sid)
+        else:
+            return
+        # Only news: a stream that resumes after sleep replays what happened meanwhile.
+        at = iso_time((ev.get("at") or "")[:19] + "Z")
+        if not changed or not self.do_notify or (at and time.time() - at > NOTICE_FRESH_S):
+            return
+        name = self.screen_name(sid, res.get("name"))
+        if etype == "screen.online":
             notify("%s is back online" % name, "", "low", glyph="󰍹")
+            return
+        payload = json.dumps({"mode": "screens", "focus": sid})
+        last = iso_time(((ev.get("details") or {}).get("last_online_at") or "")[:19] + "Z")
+        notify("%s went offline" % name, time.strftime("Last online %H:%M.", time.localtime(last)) if last else "",
+               "normal", [("Open", ["omarchy-shell", "shell", "summon", PLUGIN_ID, payload]),
+                          ("Reload", ["screenrig-omarchy", "act", sid, "reload", "--notify"]),
+                          ("Dashboard", ["xdg-open", "%s/screens/%s" % (DASHBOARD, sid)])], "󰍹")
 
     def stream(self):
         cursor = None

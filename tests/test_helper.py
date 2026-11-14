@@ -2188,6 +2188,12 @@ class FollowerNotices(unittest.TestCase):
         # Nothing but a running live cast is critical: critical stays until dismissed.
         self.assertEqual([n[2] for n in self.sent], ["normal", "low"])
 
+    def test_a_replayed_return_still_counts(self):
+        self.event("screen.offline")
+        self.event("screen.online", age=3600)
+        self.event("screen.offline")
+        self.assertEqual([n[0] for n in self.sent], ["Lobby went offline", "Lobby went offline"])
+
     def test_replayed_events_and_activated_revisions_say_nothing(self):
         self.event("screen.offline", age=3600)
         self.event("screen.manifest_upgrade", state="current")
