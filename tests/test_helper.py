@@ -1,4 +1,5 @@
 import base64
+import calendar
 import hashlib
 import http.client
 import importlib.machinery
@@ -2162,6 +2163,37 @@ class RetirePicker(unittest.TestCase):
         self.assertFalse(os.path.exists(self.conf))
 
 
+class FollowerNotices(unittest.TestCase):
+    def setUp(self):
+        self.sent = []
+        for patch in (mock.patch.object(helper, "notify", lambda *a, **k: self.sent.append(a)),
+                      mock.patch.object(helper, "emit", lambda _: None)):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.follower = helper.Follower(do_notify=True)
+        self.follower.snap = {"screens": [{"id": "scr_A", "label": "Lobby"}]}
+
+    def event(self, etype, age=0, **details):
+        at = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() - age)) + ".123Z"
+        self.follower.on_event({"type": etype, "at": at, "resource": {"type": "screen", "id": "scr_A"},
+                                "details": details})
+
+    def test_offline_is_said_once_and_leaves_by_itself(self):
+        self.event("screen.offline", last_online_at="2026-11-14T19:36:00Z")
+        self.event("screen.offline")
+        self.event("screen.online")
+        self.assertEqual([n[0] for n in self.sent], ["Lobby went offline", "Lobby is back online"])
+        self.assertEqual(self.sent[0][1], time.strftime("Last online %H:%M.", time.localtime(
+            calendar.timegm((2026, 11, 14, 19, 36, 0)))))
+        # Nothing but a running live cast is critical: critical stays until dismissed.
+        self.assertEqual([n[2] for n in self.sent], ["normal", "low"])
+
+    def test_replayed_events_and_activated_revisions_say_nothing(self):
+        self.event("screen.offline", age=3600)
+        self.event("screen.manifest_upgrade", state="current")
+        self.assertEqual(self.sent, [])
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -2316,4 +2348,3 @@ class Hardening(unittest.TestCase):
             popen.assert_not_called()
             helper.open_url("https://screenrig.ai/dashboard/")
             popen.assert_called_once()
-

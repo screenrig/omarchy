@@ -32,8 +32,9 @@ your coding agent to change what plays.
   installed, then another installed integration.
 - **Project switcher**, a screenRIG section in the Omarchy menu with every
   screen and playlist searchable, and notifications when a screen goes offline
-  or comes back, a publish reaches its screens, credits run low, an ad booking
-  needs review, or a live cast starts or stops.
+  or comes back, credits run low, an ad booking needs review, or a live cast
+  starts or stops. Each one leaves by itself after a few seconds; only a
+  running live cast stays, with its Stop.
 
 | Cast live | While casting | Agent |
 |---|---|---|

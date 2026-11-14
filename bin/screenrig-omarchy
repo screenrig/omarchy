@@ -1242,6 +1242,7 @@ MEDIAMTX_SHA256 = "0a2ea7eba96023631efa1bea7804823a9145b043b6646a8a05798d4ac24ed
 LIVE_PORT = 8554
 LIVE_PLATFORMS = ("android", "qt")
 LIVE_NOTICE = "Live cast"
+NOTICE_FRESH_S = 120    # an event older than this is history, not news
 # "Until I stop" casts hold a takeover lease the cast's owner renews; if the laptop
 # vanishes the lease runs out and the screens return to their own content.
 LIVE_LEASE_MIN = 75
@@ -2684,8 +2685,6 @@ class Follower:
         self.dirty = threading.Event()
         self.snap = None
         self.offline_notified = set()
-        self.publish = {}
-        self.publish_lock = threading.Lock()
         self.credits_low = None
         self.seen_reviews = None
         # The screenshot rotation: whether the panel shows the screens, when each screen may be asked again for a
@@ -2785,7 +2784,7 @@ class Follower:
             low = self.snap["credits"].get("low")
             if low and self.credits_low is False and self.do_notify:
                 notify("screenRIG credits are low", "%s credits left this month." % self.snap["credits"].get("remaining"),
-                       "critical", [("Billing", ["xdg-open", DASHBOARD + "/billing/settings"])], "󰄬")
+                       "normal", [("Billing", ["xdg-open", DASHBOARD + "/billing/settings"])], "󰄬")
             if low is not None:
                 self.credits_low = low
             try:
@@ -2834,14 +2833,6 @@ class Follower:
                 return s["label"]
         return fallback or sid
 
-    def flush_publish(self, playlist):
-        with self.publish_lock:
-            screens = self.publish.pop(playlist, set())
-        if screens and self.do_notify:
-            name = next((p["name"] for p in (self.snap or {}).get("playlists", []) if p["id"] == playlist), "A playlist")
-            notify("Published: %s" % name, "Now showing on %d screen%s." % (len(screens), "" if len(screens) == 1 else "s"),
-                   "low", [("Open", ["xdg-open", "%s/playlists/%s" % (DASHBOARD, playlist)])], "󰄬")
-
     def on_event(self, ev):
         etype = ev.get("type", "")
         # A screenshot's events change nothing in the snapshot, whose reads count toward the hourly request cap.
@@ -2850,30 +2841,24 @@ class Follower:
             self.dirty.set()
         emit({"kind": "event", "type": etype, "resource": ev.get("resource"), "message": ev.get("message"),
               "at": ev.get("at")})
-        if not self.do_notify:
+        # Only news: a stream that resumes after sleep replays what happened meanwhile.
+        at = iso_time((ev.get("at") or "")[:19] + "Z")
+        if not self.do_notify or (at and time.time() - at > NOTICE_FRESH_S):
             return
         res = ev.get("resource") or {}
         sid = res.get("id", "")
         name = self.screen_name(sid, res.get("name"))
-        details = ev.get("details") or {}
-        if etype == "screen.offline":
+        if etype == "screen.offline" and sid not in self.offline_notified:
             self.offline_notified.add(sid)
             payload = json.dumps({"mode": "screens", "focus": sid})
-            notify("%s went offline" % name, "Last online %s." % (details.get("last_online_at") or "")[11:16],
-                   "critical", [("Open", ["omarchy-shell", "shell", "summon", PLUGIN_ID, payload]),
-                                ("Reload", ["screenrig-omarchy", "act", sid, "reload", "--notify"]),
-                                ("Dashboard", ["xdg-open", "%s/screens/%s" % (DASHBOARD, sid)])], "󰍹")
+            last = iso_time(((ev.get("details") or {}).get("last_online_at") or "")[:19] + "Z")
+            notify("%s went offline" % name, time.strftime("Last online %H:%M.", time.localtime(last)) if last else "",
+                   "normal", [("Open", ["omarchy-shell", "shell", "summon", PLUGIN_ID, payload]),
+                              ("Reload", ["screenrig-omarchy", "act", sid, "reload", "--notify"]),
+                              ("Dashboard", ["xdg-open", "%s/screens/%s" % (DASHBOARD, sid)])], "󰍹")
         elif etype == "screen.online" and sid in self.offline_notified:
             self.offline_notified.discard(sid)
             notify("%s is back online" % name, "", "low", glyph="󰍹")
-        elif etype == "screen.manifest_upgrade" and details.get("state") == "current":
-            playlist = next((s.get("playing_id") for s in (self.snap or {}).get("screens", []) if s["id"] == sid), None)
-            if playlist:
-                with self.publish_lock:
-                    first = playlist not in self.publish
-                    self.publish.setdefault(playlist, set()).add(sid)
-                if first:
-                    threading.Timer(10, self.flush_publish, [playlist]).start()
 
     def stream(self):
         cursor = None
