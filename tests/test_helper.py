@@ -1809,6 +1809,92 @@ class BadAnswers(unittest.TestCase):
         self.assertEqual([s["ok"] for s in sent], [True, False])
 
 
+class PlaylistPulls(unittest.TestCase):
+    """The follower reads the playlist list when a playlist event, a resync or the long interval says it may have
+    changed, and keeps the names between refreshes."""
+    CFG = {"api_url": "https://api.example.invalid", "project_id": "prj_1"}
+
+    def setUp(self):
+        self.clock = [time.time()]
+        self.paths = []
+        self.names = {"pl_1": "Welcome"}
+        fake_time = mock.Mock(wraps=time)
+        fake_time.time = lambda: self.clock[0]
+        for patch in (mock.patch.object(helper, "time", fake_time),
+                      mock.patch.object(helper, "access_token", return_value=(self.CFG, "token")),
+                      mock.patch.object(helper, "api", self.api), mock.patch.object(helper, "emit"),
+                      mock.patch.object(helper, "menu_sync"), mock.patch.object(helper, "fetch_all_shots")):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.follower = helper.Follower(do_notify=False)
+
+    def api(self, method, path, body=None, **kw):
+        self.paths.append(path.split("?")[0])
+        if path.startswith("/api/playlists?"):
+            return {"items": [{"id": i, "name": n, "approved_revision": 1} for i, n in self.names.items()]}
+        return {"items": [{"id": "scr_A", "label": "Lobby", "state": "active", "online": True, "playlist_id": "pl_1"}]}
+
+    def pulls(self):
+        return self.paths.count("/api/playlists")
+
+    def test_the_first_refresh_reads_the_list_and_later_ones_keep_it(self):
+        self.follower.refresh()
+        self.follower.refresh()
+        self.follower.refresh()
+        self.assertEqual(self.pulls(), 1)
+        self.assertEqual(self.paths.count("/api/screens"), 3)
+        self.assertEqual(self.follower.snap["playlists"], [{"id": "pl_1", "name": "Welcome", "approved": True}])
+        self.assertEqual(self.follower.snap["screens"][0]["playlist_name"], "Welcome")
+
+    def test_a_playlist_event_makes_the_next_refresh_read_it_again(self):
+        self.follower.refresh()
+        self.follower.on_event({"type": "screen.online", "resource": {"id": "scr_A"}})
+        self.follower.refresh()
+        self.assertEqual(self.pulls(), 1)
+        self.names["pl_2"] = "Menu"
+        for etype in ("playlist.created", "playlist.updated", "playlist.deleted"):
+            self.follower.on_event({"type": etype, "resource": {"id": "pl_2"}})
+            self.follower.refresh()
+        self.assertEqual(self.pulls(), 4)
+        self.assertEqual([p["name"] for p in self.follower.snap["playlists"]], ["Menu", "Welcome"])
+        self.follower.refresh()
+        self.assertEqual(self.pulls(), 4)
+
+    def test_a_resync_and_the_long_interval_read_it_again(self):
+        self.follower.refresh()
+        self.clock[0] += helper.PLAYLISTS_REFETCH_S - 1
+        self.follower.refresh()
+        self.assertEqual(self.pulls(), 1)
+        self.clock[0] += 1
+        self.follower.refresh()
+        self.assertEqual(self.pulls(), 2)
+        self.follower.playlists_stale = True
+        self.follower.refresh()
+        self.assertEqual(self.pulls(), 3)
+
+    def test_a_refresh_that_failed_reads_the_list_again(self):
+        with mock.patch.object(helper, "paged", side_effect=helper.Problem("down")):
+            self.follower.refresh()
+        self.assertIsNone(self.follower.snap)
+        self.follower.refresh()
+        self.assertEqual(self.pulls(), 1)
+        self.assertEqual(self.follower.snap["playlists"][0]["id"], "pl_1")
+
+    def test_a_playlist_event_during_the_pull_is_not_lost(self):
+        def during(method, path, body=None, **kw):
+            if path.startswith("/api/playlists?"):
+                self.follower.on_event({"type": "playlist.updated", "resource": {"id": "pl_1"}})
+            return self.api(method, path)
+        with mock.patch.object(helper, "api", during):
+            self.follower.refresh()
+        self.follower.refresh()
+        self.assertEqual(self.pulls(), 2)
+
+    def test_the_cli_snapshot_still_reads_everything(self):
+        helper.snapshot()
+        self.assertEqual(self.pulls(), 1)
+
+
 class ShotRotation(unittest.TestCase):
     """The panel's automatic screenshots against a stand-in for the screenshot API, on a clock of its own."""
 

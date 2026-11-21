@@ -36,6 +36,8 @@ Rules:
   `shot ID` and comes first. It never asks over a pending capture and never
   refreshes the snapshot for a screenshot event: snapshot reads count toward
   the hourly request cap, screenshot routes do not.
+- The playlist list is the snapshot's heaviest read and has no lighter form: `Follower.refresh` pulls it
+  only after a `playlist.*` event, a resync or `PLAYLISTS_REFETCH_S`, and keeps the names between refreshes.
 - Gate: `python3 -m unittest discover -s tests` and `omarchy plugin validate .`.
 
 UI:

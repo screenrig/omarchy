@@ -409,7 +409,7 @@ def paged(path):
 SHOT_WAIT_S = 30        # the API's capture lifetime: a Player that has not sent its picture by then will not
 SHOT_GAP_S = 10         # between one capture's end and the next request: at most 6 a minute, a fifth of the
                         # organization's screenshot limit
-SHOT_MIN_AGE_S = 120    # a screen is asked again at most every two minutes, counted from anyone's request
+SHOT_MIN_AGE_S = 300    # a screen is asked again at most every five minutes, counted from anyone's request
 SHOT_HOLD_S = 60        # after a refusal that names no Retry-After
 SHOT_DENIED_S = 3600    # a screen refused with 402 or 403 (a capture needs Propose or Manage access to it)
 
@@ -458,13 +458,25 @@ def safe_ids(items):
     return [item for item in items if SAFE_ID.fullmatch(str(item.get("id") or ""))]
 
 
-def snapshot():
+# The playlist list has no lighter form (every item is the whole playlist) and the
+# snapshot reads only each playlist's id, name and approval: the follower pulls it again when a playlist event
+# says it changed, or after this long in case an event never came.
+PLAYLISTS_REFETCH_S = 1800
+
+
+def snapshot(playlists=None):
+    """The project's screens and playlists. `playlists` is a list this function made earlier: it is used as it is
+    instead of pulling the project's playlist list again."""
     cfg, _ = access_token()
     pid = project_id(cfg)
     if not SAFE_ID.fullmatch(pid):
         raise Problem("The screenRIG sign-in names a project id that is not valid.")
-    playlists = safe_ids(paged("/api/playlists?project=" + pid))
-    names = {p["id"]: p.get("name") or p["id"] for p in playlists}
+    if playlists is None:
+        listed = safe_ids(paged("/api/playlists?project=" + pid))
+        names = {p["id"]: p.get("name") or p["id"] for p in listed}
+        playlists = [{"id": p["id"], "name": names[p["id"]], "approved": p.get("approved_revision") is not None}
+                     for p in sorted(listed, key=lambda p: names[p["id"]].lower())]
+    names = {p["id"]: p["name"] for p in playlists}
     screens = [summarize_screen(s, names) for s in safe_ids(paged("/api/screens?project=" + pid))
                if s.get("state") == "active"]
     screens.sort(key=lambda s: (not s["online"], s["label"].lower()))
@@ -473,8 +485,7 @@ def snapshot():
         "at": time.time(),
         "project": {"id": pid, "name": cfg.get("project_name", ""), "organization": cfg.get("organization_name", "")},
         "screens": screens,
-        "playlists": [{"id": p["id"], "name": names[p["id"]], "approved": p.get("approved_revision") is not None}
-                      for p in sorted(playlists, key=lambda p: names[p["id"]].lower())],
+        "playlists": playlists,
     }
 
 
@@ -2692,6 +2703,10 @@ class Follower:
         self.shots_wake = threading.Event()
         self.shot_due = {}
         self.shot_next = 0.0
+        # The playlists in `snap` are kept between refreshes: a playlist event, a resync or the long interval
+        # makes the next refresh pull the list again.
+        self.playlists_stale = True
+        self.playlists_at = 0.0
 
     def set_shown(self, shown):
         self.shown = shown
@@ -2777,8 +2792,14 @@ class Follower:
             self.shots_wake.clear()
 
     def refresh(self):
+        held = (self.snap or {}).get("playlists")
+        pull = held is None or self.playlists_stale or time.time() - self.playlists_at >= PLAYLISTS_REFETCH_S
+        # An event that arrives while the list is pulled sets the flag again.
+        self.playlists_stale = False
         try:
-            self.snap = snapshot()
+            self.snap = snapshot(None if pull else held)
+            if pull:
+                self.playlists_at = time.time()
             emit(self.snap)
             try:
                 menu_sync(self.snap)
@@ -2794,6 +2815,7 @@ class Follower:
             # A screen paired or back online since need not wait out the rotation's sleep.
             self.shots_wake.set()
         except Problem as err:
+            self.playlists_stale = self.playlists_stale or pull
             emit({"kind": "status", "ok": False, "error": str(err)})
 
     def snapshot_loop(self):
@@ -2838,6 +2860,8 @@ class Follower:
 
     def on_event(self, ev):
         etype = ev.get("type", "")
+        if etype.startswith("playlist.") or etype.startswith("playlists."):
+            self.playlists_stale = True
         # A screenshot's events change nothing in the snapshot, whose reads count toward the hourly request cap.
         if (etype.startswith("screen.") and not etype.startswith("screen.screenshot_")) or \
                 etype.startswith("playlist.") or etype.startswith("operation."):
@@ -2908,6 +2932,7 @@ class Follower:
                                 break
                             if event == "stream.resync_required":
                                 cursor = None
+                                self.playlists_stale = True
                                 self.dirty.set()
                             elif event not in ("stream.cursor", "problem"):
                                 try:
