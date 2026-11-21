@@ -2794,8 +2794,9 @@ class Follower:
     def refresh(self):
         held = (self.snap or {}).get("playlists")
         pull = held is None or self.playlists_stale or time.time() - self.playlists_at >= PLAYLISTS_REFETCH_S
-        # An event that arrives while the list is pulled sets the flag again.
-        self.playlists_stale = False
+        # Cleared before the pull, so an event that arrives during it sets the flag again.
+        if pull:
+            self.playlists_stale = False
         try:
             self.snap = snapshot(None if pull else held)
             if pull:
@@ -2860,7 +2861,8 @@ class Follower:
 
     def on_event(self, ev):
         etype = ev.get("type", "")
-        if etype.startswith("playlist.") or etype.startswith("playlists."):
+        # A review's approval is what makes a playlist approved: it emits no playlist event of its own.
+        if etype.startswith(("playlist.", "playlists.", "review.")):
             self.playlists_stale = True
         # A screenshot's events change nothing in the snapshot, whose reads count toward the hourly request cap.
         if (etype.startswith("screen.") and not etype.startswith("screen.screenshot_")) or \

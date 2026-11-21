@@ -1852,13 +1852,13 @@ class PlaylistPulls(unittest.TestCase):
         self.follower.refresh()
         self.assertEqual(self.pulls(), 1)
         self.names["pl_2"] = "Menu"
-        for etype in ("playlist.created", "playlist.updated", "playlist.deleted"):
+        for etype in ("playlist.created", "playlist.updated", "playlist.deleted", "review.approved"):
             self.follower.on_event({"type": etype, "resource": {"id": "pl_2"}})
             self.follower.refresh()
-        self.assertEqual(self.pulls(), 4)
+        self.assertEqual(self.pulls(), 5)
         self.assertEqual([p["name"] for p in self.follower.snap["playlists"]], ["Menu", "Welcome"])
         self.follower.refresh()
-        self.assertEqual(self.pulls(), 4)
+        self.assertEqual(self.pulls(), 5)
 
     def test_a_resync_and_the_long_interval_read_it_again(self):
         self.follower.refresh()
