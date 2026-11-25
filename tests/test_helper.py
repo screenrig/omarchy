@@ -1880,6 +1880,21 @@ class PlaylistPulls(unittest.TestCase):
         self.assertEqual(self.pulls(), 1)
         self.assertEqual(self.follower.snap["playlists"][0]["id"], "pl_1")
 
+    def test_a_screens_read_that_fails_after_the_list_was_pulled_keeps_the_list(self):
+        real = self.api
+
+        def screens_down(method, path, body=None, **kw):
+            if path.startswith("/api/screens?"):
+                raise helper.Problem("busy", 429)
+            return real(method, path)
+        with mock.patch.object(helper, "api", screens_down):
+            self.follower.refresh()
+            self.follower.refresh()
+        self.assertEqual(self.pulls(), 1)
+        self.follower.refresh()
+        self.assertEqual(self.pulls(), 1)
+        self.assertEqual(self.follower.snap["screens"][0]["playlist_name"], "Welcome")
+
     def test_a_playlist_event_during_the_pull_is_not_lost(self):
         def during(method, path, body=None, **kw):
             if path.startswith("/api/playlists?"):
@@ -1893,6 +1908,123 @@ class PlaylistPulls(unittest.TestCase):
     def test_the_cli_snapshot_still_reads_everything(self):
         helper.snapshot()
         self.assertEqual(self.pulls(), 1)
+
+
+class StreamResume(unittest.TestCase):
+    """A dropped stream resumes from its cursor: only the server's resync, or an event that says so, makes the
+    follower read the playlist list or the screens again."""
+    CFG = {"api_url": "https://api.example.invalid", "project_id": "prj_1"}
+
+    @staticmethod
+    def frames(*frames):
+        """Each frame is (event, id, data)."""
+        out = []
+        for event, ident, data in frames:
+            out.append(b": heartbeat\n")
+            out.append(b"\n")
+            if event:
+                out.append(("event: %s\n" % event).encode())
+            if ident:
+                out.append(("id: %s\n" % ident).encode())
+            out.append(("data: %s\n" % data).encode())
+            out.append(b"\n")
+        return out
+
+    def run_stream(self, *connections, clock=None, sleeps=None, lived=0):
+        """Run stream() over these connections (lists of lines); returns the follower, the Last-Event-ID each one
+        sent and the read timeout of each."""
+        sent, follower = [], helper.Follower(do_notify=False)
+        now = clock if clock is not None else [time.time()]
+        fake_time = mock.Mock(wraps=time)
+        fake_time.time = lambda: now[0]
+        fake_time.sleep = lambda s: (sleeps.append(s) if sleeps is not None else None, now.__setitem__(0, now[0] + s))
+        follower.playlists_stale = False
+        follower.dirty.clear()
+        queue = list(connections)
+
+        def urlopen(req, timeout=None):
+            sent.append((req.get_header("Last-event-id"), timeout))
+            if not queue:
+                raise Stop
+            lines = queue.pop(0)
+
+            def read():
+                now[0] += lived     # how long the connection stays open before its lines come
+                yield from lines
+            return read()
+        with mock.patch.object(helper.urllib.request, "urlopen", urlopen), \
+             mock.patch.object(helper, "access_token", return_value=(self.CFG, "token")), \
+             mock.patch.object(helper, "emit"), mock.patch.object(helper, "time", fake_time):
+            with self.assertRaises(Stop):
+                follower.stream()
+        return follower, [s[0] for s in sent], [s[1] for s in sent]
+
+    def test_a_reconnect_resumes_from_the_cursor_and_reads_nothing_again(self):
+        first = self.frames(("screen.screenshot_ready", "c1", '{"type":"screen.screenshot_ready"}'),
+                            ("stream.cursor", "c2", '{"type":"stream.cursor"}'))
+        follower, ids, _ = self.run_stream(first, first, first)
+        self.assertEqual(ids, [None, "c2", "c2", "c2"])
+        self.assertFalse(follower.playlists_stale)
+        self.assertFalse(follower.dirty.is_set())
+
+    def test_the_servers_token_expiry_reconnects_at_once_with_the_cursor(self):
+        lines = self.frames(("", "c1", '{"type":"screen.screenshot_ready"}'),
+                            ("reauth", "", '{"reason":"token_expired"}'))
+        sleeps = []
+        with mock.patch.object(helper, "access_token", return_value=(self.CFG, "token")):
+            follower, ids, _ = self.run_stream(lines, lines, sleeps=sleeps, lived=600)
+        self.assertEqual(ids, [None, "c1", "c1"])
+        self.assertEqual(sleeps, [])
+        self.assertFalse(follower.playlists_stale)
+        self.assertFalse(follower.dirty.is_set())
+
+    def test_a_stream_that_is_ended_the_moment_it_opens_backs_off(self):
+        lines = self.frames(("reauth", "", '{"reason":"revoked"}'))
+        sleeps = []
+        self.run_stream(lines, lines, sleeps=sleeps)
+        self.assertEqual(sleeps, [1, 1])
+
+    def test_a_long_gap_without_a_cursor_reads_everything_again_and_a_short_one_does_not(self):
+        quiet = []
+        now = [time.time()]
+        follower, ids, _ = self.run_stream(quiet, quiet, clock=now)
+        self.assertFalse(follower.playlists_stale)
+        self.assertFalse(follower.dirty.is_set())
+
+        follower = helper.Follower(do_notify=False)
+        follower.playlists_stale = False
+        follower.dirty.clear()
+        opened = []
+
+        def urlopen(req, timeout=None):
+            opened.append(1)
+            if len(opened) == 2:
+                now[0] += helper.STREAM_GAP_S
+            if len(opened) > 2:
+                raise Stop
+            return iter([])
+        with mock.patch.object(helper.urllib.request, "urlopen", urlopen), \
+             mock.patch.object(helper, "access_token", return_value=(self.CFG, "token")), \
+             mock.patch.object(helper, "emit"):
+            fake_time = mock.Mock(wraps=time)
+            fake_time.time = lambda: now[0]
+            fake_time.sleep = lambda s: None
+            with mock.patch.object(helper, "time", fake_time), self.assertRaises(Stop):
+                follower.stream()
+        self.assertTrue(follower.playlists_stale)
+        self.assertTrue(follower.dirty.is_set())
+
+    def test_a_resync_drops_the_cursor_and_reads_everything_again(self):
+        lines = self.frames(("", "c1", '{"type":"screen.screenshot_ready"}'),
+                            ("stream.resync_required", "c9", '{"type":"stream.resync_required"}'))
+        follower, ids, _ = self.run_stream(lines, [])
+        self.assertEqual(ids, [None, None, None])
+        self.assertTrue(follower.playlists_stale)
+        self.assertTrue(follower.dirty.is_set())
+
+    def test_the_read_timeout_outlasts_the_servers_heartbeat(self):
+        _, _, timeouts = self.run_stream([])
+        self.assertGreaterEqual(timeouts[0], 3 * 15)
 
 
 class ShotRotation(unittest.TestCase):
@@ -2027,6 +2159,60 @@ class ShotRotation(unittest.TestCase):
         self.assertEqual(self.follower.shots_wake.wait.call_args_list, [mock.call(timeout=helper.SHOT_GAP_S),
                                                                         mock.call(timeout=10)])
         warned.assert_called_once()
+
+    def test_a_stored_image_is_asked_for_again_with_its_etag_and_a_304_keeps_it(self):
+        etags = iter(['"a"', '"b"'])
+        sent = []
+
+        def api(method, path, body=None, **kw):
+            if method == "GET" and path.endswith("/screenshot"):
+                sent.append(kw["headers"].get("If-None-Match"))
+                if sent[-1] == '"a"':
+                    return None, {}
+                return b"webp-" + str(len(sent)).encode(), {"ETag": next(etags)}
+            return self.api(method, path, body, **kw)
+        with mock.patch.object(helper, "api", api):
+            helper.fetch_shot("scr_A")
+            first = self.image("scr_A")
+            helper.fetch_shot("scr_A")
+        self.assertEqual(sent, [None, '"a"'])
+        self.assertEqual(self.image("scr_A"), first)
+        with mock.patch.object(helper, "api", api):
+            # A 200 replaces the image and its ETag together.
+            os.unlink(helper.etag_path("scr_A"))
+            helper.fetch_shot("scr_A")
+        self.assertEqual(sent[-1], None)
+        self.assertEqual(helper.shot_etag("scr_A"), '"b"')
+
+    def test_an_etag_of_an_image_that_was_replaced_is_not_sent(self):
+        with mock.patch.object(helper, "api", return_value=(b"webp", {"ETag": '"a"'})):
+            helper.fetch_shot("scr_A")
+        self.assertEqual(helper.shot_etag("scr_A"), '"a"')
+        with open(helper.shot_path("scr_A"), "wb") as f:   # another writer's image, without its ETag yet
+            f.write(b"other bytes")
+        self.assertEqual(helper.shot_etag("scr_A"), "")
+
+    def test_a_304_counts_as_a_check_and_the_image_is_not_asked_for_again_for_ten_minutes(self):
+        with mock.patch.object(helper, "api", return_value=(b"webp", {"ETag": '"a"'})):
+            helper.fetch_shot("scr_A")
+        old = time.time() - 3600
+        os.utime(helper.shot_path("scr_A"), (old, old))
+        st = os.stat(helper.shot_path("scr_A"))   # the record names the file it describes: age both together
+        with open(helper.etag_path("scr_A"), "w") as f:
+            json.dump({"etag": '"a"', "mtime_ns": st.st_mtime_ns, "size": st.st_size}, f)
+        os.utime(helper.etag_path("scr_A"), (old, old))
+        mtime = os.path.getmtime(helper.shot_path("scr_A"))
+        calls = []
+
+        def api(method, path, body=None, **kw):
+            calls.append(kw["headers"].get("If-None-Match"))
+            return None, {}
+        screens = [{"id": "scr_A"}]
+        with mock.patch.object(helper, "api", api):
+            helper.fetch_all_shots(screens)
+            helper.fetch_all_shots(screens)
+        self.assertEqual(calls, ['"a"'])
+        self.assertEqual(os.path.getmtime(helper.shot_path("scr_A")), mtime)
 
     def test_a_new_snapshot_wakes_the_rotation(self):
         with mock.patch.object(helper, "snapshot", return_value={"screens": []}), \

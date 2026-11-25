@@ -38,6 +38,9 @@ Rules:
   the hourly request cap, screenshot routes do not.
 - The playlist list is the snapshot's heaviest read and has no lighter form: `Follower.refresh` pulls it
   only after a `playlist.*` event, a resync or `PLAYLISTS_REFETCH_S`, and keeps the names between refreshes.
+- A stored screenshot keeps the API's `ETag` beside it (`shots/ID.etag`, valid only for the image it names) and is read
+  again with `If-None-Match`; a 304 keeps the image. A stream that drops resumes from its last cursor and reads
+  nothing again; only `stream.resync_required`, or a gap of `STREAM_GAP_S` with no cursor, makes the next refresh pull the lists.
 - Gate: `python3 -m unittest discover -s tests` and `omarchy plugin validate .`.
 
 UI:

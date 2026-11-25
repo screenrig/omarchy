@@ -372,6 +372,9 @@ def _send(method, path, body, raw, headers, _retried=False):
                 return payload, resp.headers
             return json.loads(payload) if payload else {}
     except urllib.error.HTTPError as err:
+        if err.code == 304 and raw and "If-None-Match" in h:
+            # The copy the caller holds is current: no body, and `None` says so.
+            return None, err.headers
         payload = error_body(err)
         if err.code == 401 and not _retried and "invalid_token" in (err.headers.get("WWW-Authenticate") or ""):
             access_token(force=True)
@@ -418,6 +421,35 @@ def shot_path(screen_id):
     return os.path.join(CACHE, "shots", screen_id + ".webp")
 
 
+def etag_path(screen_id):
+    return shot_path(screen_id)[:-len(".webp")] + ".etag"
+
+
+def shot_etag(screen_id):
+    """The ETag the API gave the stored image, or "" when it is unknown or the image has been replaced since
+    (the record names the file it describes, so two writers of one screen cannot leave a pair that disagrees)."""
+    try:
+        with open(etag_path(screen_id)) as f:
+            record = json.load(f)
+        st = os.stat(shot_path(screen_id))
+        if record["mtime_ns"] == st.st_mtime_ns and record["size"] == st.st_size and isinstance(record["etag"], str):
+            return record["etag"]
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return ""
+
+
+def shot_checked(screen_id):
+    """When the stored image was last known to be the API's current one: its write, or the last answer of 304."""
+    stamps = [0.0]
+    for path in (shot_path(screen_id), etag_path(screen_id)):
+        try:
+            stamps.append(os.path.getmtime(path))
+        except OSError:
+            pass
+    return max(stamps)
+
+
 def summarize_screen(s, names):
     eff = s.get("effective_playlist") or {}
     display = s.get("display") or {}
@@ -462,11 +494,15 @@ def safe_ids(items):
 # snapshot reads only each playlist's id, name and approval: the follower pulls it again when a playlist event
 # says it changed, or after this long in case an event never came.
 PLAYLISTS_REFETCH_S = 1800
+# A stream that was down this long without a cursor to resume from may have missed any event: the follower then
+# reads the list and the screens again. A shorter gap (the reconnect after the API's token-expiry notice) is not.
+STREAM_GAP_S = 60
 
 
-def snapshot(playlists=None):
+def snapshot(playlists=None, keep=None):
     """The project's screens and playlists. `playlists` is a list this function made earlier: it is used as it is
-    instead of pulling the project's playlist list again."""
+    instead of pulling the project's playlist list again. `keep` is called with a list this call pulled, before
+    the screens are read, so a screens read that fails does not cost the list."""
     cfg, _ = access_token()
     pid = project_id(cfg)
     if not SAFE_ID.fullmatch(pid):
@@ -476,6 +512,8 @@ def snapshot(playlists=None):
         names = {p["id"]: p.get("name") or p["id"] for p in listed}
         playlists = [{"id": p["id"], "name": names[p["id"]], "approved": p.get("approved_revision") is not None}
                      for p in sorted(listed, key=lambda p: names[p["id"]].lower())]
+        if keep:
+            keep(playlists)
     names = {p["id"]: p["name"] for p in playlists}
     screens = [summarize_screen(s, names) for s in safe_ids(paged("/api/screens?project=" + pid))
                if s.get("state") == "active"]
@@ -510,13 +548,37 @@ def fetch_shot(screen_id, fresh=False):
                 raise Problem("The screen did not return a screenshot (timed_out).")
             time.sleep(1)
     q = "?capture_id=" + urllib.parse.quote(capture) if capture else ""
-    data, _ = api("GET", "/api/screens/%s/screenshot%s" % (screen_id, q), raw=True,
-                  headers={"Accept": "image/webp"})
+    headers = {"Accept": "image/webp"}
+    have = shot_etag(screen_id)
+    if have:
+        # The API answers 304 to the ETag of the image already stored, without reading it again.
+        headers["If-None-Match"] = have
+    data, answer = api("GET", "/api/screens/%s/screenshot%s" % (screen_id, q), raw=True, headers=headers)
+    if data is None:
+        try:
+            os.utime(etag_path(screen_id))
+        except OSError:
+            pass
+        return shot_path(screen_id)
     # The panel's rotation, the snapshot loop and a separate `shot` command can write the same screen at once.
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(shot_path(screen_id)), suffix=".tmp")
     with os.fdopen(fd, "wb") as f:
         f.write(data)
+    st = os.stat(tmp)
     os.replace(tmp, shot_path(screen_id))
+    etag = (answer or {}).get("ETag") or ""
+    try:
+        if etag:
+            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(shot_path(screen_id)), suffix=".tmp")
+            with os.fdopen(fd, "w") as f:
+                json.dump({"etag": etag, "mtime_ns": st.st_mtime_ns, "size": st.st_size}, f)
+            os.replace(tmp, etag_path(screen_id))
+        else:
+            os.unlink(etag_path(screen_id))
+    except FileNotFoundError:
+        pass
+    except OSError as err:
+        warn("screenshot ETag not kept: %s" % why(err))
     return shot_path(screen_id)
 
 
@@ -524,7 +586,7 @@ def fetch_all_shots(screens):
     """Latest stored screenshots for screens whose copy is older than ten minutes."""
     for s in screens:
         path = shot_path(s["id"])
-        if os.path.exists(path) and time.time() - os.path.getmtime(path) < 600:
+        if os.path.exists(path) and time.time() - shot_checked(s["id"]) < 600:
             continue
         try:
             fetch_shot(s["id"])
@@ -2705,6 +2767,7 @@ class Follower:
         self.shot_next = 0.0
         # The playlists in `snap` are kept between refreshes: a playlist event, a resync or the long interval
         # makes the next refresh pull the list again.
+        self.playlists = None
         self.playlists_stale = True
         self.playlists_at = 0.0
 
@@ -2791,16 +2854,17 @@ class Follower:
             self.shots_wake.wait(timeout=wait)
             self.shots_wake.clear()
 
+    def keep_playlists(self, playlists):
+        self.playlists, self.playlists_at = playlists, time.time()
+
     def refresh(self):
-        held = (self.snap or {}).get("playlists")
+        held = self.playlists
         pull = held is None or self.playlists_stale or time.time() - self.playlists_at >= PLAYLISTS_REFETCH_S
         # Cleared before the pull, so an event that arrives during it sets the flag again.
         if pull:
             self.playlists_stale = False
         try:
-            self.snap = snapshot(None if pull else held)
-            if pull:
-                self.playlists_at = time.time()
+            self.snap = snapshot(None if pull else held, self.keep_playlists)
             emit(self.snap)
             try:
                 menu_sync(self.snap)
@@ -2816,7 +2880,8 @@ class Follower:
             # A screen paired or back online since need not wait out the rotation's sleep.
             self.shots_wake.set()
         except Problem as err:
-            self.playlists_stale = self.playlists_stale or pull
+            # A list that was pulled stays pulled when the screens read after it failed.
+            self.playlists_stale = self.playlists_stale or (pull and self.playlists is held)
             emit({"kind": "status", "ok": False, "error": str(err)})
 
     def snapshot_loop(self):
@@ -2911,7 +2976,9 @@ class Follower:
     def stream(self):
         cursor = None
         backoff = 1
+        down_since = None   # when the connection last ended; None before the first one
         while True:
+            renewed = False
             try:
                 cfg, token = access_token()
                 url = "%s/stream/project?project=%s" % (api_base(cfg), project_id(cfg))
@@ -2922,6 +2989,11 @@ class Follower:
                 resp = urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=45)
                 emit({"kind": "status", "ok": True})
                 backoff = 1
+                opened = time.time()
+                if cursor is None and down_since is not None and time.time() - down_since >= STREAM_GAP_S:
+                    # Nothing to resume from after a long gap: the stream starts at the head and replays nothing.
+                    self.playlists_stale = True
+                    self.dirty.set()
                 event, data, ident = "message", [], None
                 for raw in resp:
                     line = raw.decode(errors="replace").rstrip("\r\n")
@@ -2930,7 +3002,10 @@ class Follower:
                             if ident:
                                 cursor = ident
                             if event == "reauth":
+                                # The API ends a stream when its token expires; resume with the new one at once.
                                 access_token(force=True)
+                                # A stream that ends the moment it opens is not a token running out: back off.
+                                renewed = time.time() - opened >= 5
                                 break
                             if event == "stream.resync_required":
                                 cursor = None
@@ -2960,8 +3035,10 @@ class Follower:
                     emit({"kind": "status", "ok": False, "error": problem_message(err.code, error_body(err))})
             except (Problem, OSError, urllib.error.URLError, http.client.HTTPException) as err:
                 emit({"kind": "status", "ok": False, "error": str(err)})
-            time.sleep(backoff)
-            backoff = min(backoff * 2, 60)
+            down_since = time.time()
+            if not renewed:
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 60)
 
     def run(self):
         threading.Thread(target=self.snapshot_loop, daemon=True).start()
